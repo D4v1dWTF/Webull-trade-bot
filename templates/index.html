@@ -3,7 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>GameBoy Trading Bot</title>
+    <title>TradeBoy</title>
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
     <style>
         * { box-sizing: border-box; user-select: none; }
         body {
@@ -21,7 +22,7 @@
             border-radius: 20px;
             box-shadow: 0 10px 0 #5a5a5a;
             padding: 20px 20px 30px;
-            max-width: 550px;
+            max-width: 620px;
             width: 100%;
         }
         .screen {
@@ -29,12 +30,11 @@
             border: 5px solid #306230;
             border-radius: 12px;
             padding: 10px;
-            margin-bottom: 20px;
-            min-height: 320px;
+            margin-bottom: 15px;
             font-family: monospace;
             color: #0f380f;
             font-weight: bold;
-            font-size: 14px;
+            font-size: 13px;
             box-shadow: inset 0 0 5px #306230;
         }
         .balance {
@@ -44,7 +44,7 @@
             border-radius: 8px;
             margin-bottom: 10px;
             text-align: center;
-            font-size: 16px;
+            font-size: 15px;
         }
         .positions {
             background: #e0f0d0;
@@ -53,6 +53,7 @@
             max-height: 200px;
             overflow-y: auto;
             font-size: 12px;
+            margin-bottom: 10px;
         }
         .positions table {
             width: 100%;
@@ -63,11 +64,27 @@
             padding: 4px 2px;
             border-bottom: 1px solid #7c8c5e;
         }
+        .log-area {
+            background: #0f380f;
+            color: #9bbc0f;
+            padding: 6px;
+            border-radius: 8px;
+            height: 150px;
+            overflow-y: auto;
+            font-size: 11px;
+            font-family: monospace;
+            margin-bottom: 15px;
+            text-align: left;
+        }
+        .log-area p {
+            margin: 2px 0;
+            border-bottom: 1px dotted #306230;
+        }
         .controls {
             display: flex;
             justify-content: space-around;
             gap: 15px;
-            margin-top: 10px;
+            margin-top: 5px;
         }
         button {
             background: #4b4b4b;
@@ -107,25 +124,93 @@
             margin-top: 10px;
             color: #306230;
         }
+        /* 自訂模態框 */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.6);
+            align-items: center;
+            justify-content: center;
+        }
+        .modal-content {
+            background-color: #b5b5b5;
+            border-radius: 20px;
+            padding: 20px;
+            text-align: center;
+            max-width: 280px;
+            font-family: monospace;
+            border: 3px solid #306230;
+        }
+        .modal-buttons {
+            display: flex;
+            justify-content: space-around;
+            margin-top: 20px;
+        }
+        .modal-buttons button {
+            font-size: 16px;
+            padding: 8px 12px;
+            width: 80px;
+        }
     </style>
 </head>
 <body>
 <div class="gameboy">
     <div class="screen">
-        <div class="balance" id="balanceArea">💰 加载中...</div>
-        <div class="positions" id="positionsArea">📋 持仓列表</div>
+        <div class="balance" id="balanceArea">💰 載入中...</div>
+        <div class="positions" id="positionsArea">📋 持倉列表</div>
+        <div class="log-area" id="logArea">📜 日誌區域</div>
     </div>
     <div class="controls">
-        <button class="start" id="btnStart">▶ 开始</button>
+        <button class="start" id="btnStart">▶ 開始</button>
         <button class="stop" id="btnStop">⏹ 停止</button>
-        <button class="force" id="btnForce">⛔ 平仓并停止</button>
+        <button class="force" id="btnForce">⛔ 平倉並停止</button>
     </div>
     <div class="refresh-note">
-        <span id="statusLed" class="status stopped"></span> 机器人状态：<span id="runStatus">已停止</span>
+        <span id="statusLed" class="status stopped"></span> 機器人狀態：<span id="runStatus">已停止</span>
+    </div>
+</div>
+
+<!-- 自訂確認模態框 -->
+<div id="confirmModal" class="modal">
+    <div class="modal-content">
+        <p id="modalMessage">確定要執行此操作嗎？</p>
+        <div class="modal-buttons">
+            <button id="modalConfirm">確認</button>
+            <button id="modalCancel">取消</button>
+        </div>
     </div>
 </div>
 
 <script>
+    let pendingAction = null;
+
+    function showModal(message, onConfirm) {
+        const modal = document.getElementById('confirmModal');
+        const msgSpan = document.getElementById('modalMessage');
+        msgSpan.innerText = message;
+        modal.style.display = 'flex';
+        const confirmBtn = document.getElementById('modalConfirm');
+        const cancelBtn = document.getElementById('modalCancel');
+        const handler = () => {
+            modal.style.display = 'none';
+            confirmBtn.removeEventListener('click', handler);
+            cancelBtn.removeEventListener('click', cancelHandler);
+            onConfirm();
+        };
+        const cancelHandler = () => {
+            modal.style.display = 'none';
+            confirmBtn.removeEventListener('click', handler);
+            cancelBtn.removeEventListener('click', cancelHandler);
+        };
+        confirmBtn.addEventListener('click', handler);
+        cancelBtn.addEventListener('click', cancelHandler);
+    }
+
     function fetchStatus() {
         fetch('/status')
             .then(res => res.json())
@@ -135,21 +220,22 @@
                 const statusText = document.getElementById('runStatus');
                 if (isRunning) {
                     led.className = 'status running';
-                    statusText.innerText = '运行中';
+                    statusText.innerText = '運行中';
                 } else {
                     led.className = 'status stopped';
                     statusText.innerText = '已停止';
                 }
+                const username = data.username || '未知';
                 const total = data.total || 0;
                 const available = data.available || 0;
                 document.getElementById('balanceArea').innerHTML = `
-                    💰 净资产: $${total.toFixed(2)} &nbsp;| 可用: $${available.toFixed(2)}
+                    👤 ${username} &nbsp;| 💰 淨資產: $${total.toFixed(2)} &nbsp;| 可用: $${available.toFixed(2)}
                 `;
                 const positions = data.positions || [];
                 if (positions.length === 0) {
-                    document.getElementById('positionsArea').innerHTML = '📋 暂无持仓';
+                    document.getElementById('positionsArea').innerHTML = '📋 暫無持倉';
                 } else {
-                    let html = `<tr><tr><th>股票</th><th>股数</th><th>成本</th><th>现价</th><th>盈亏</th></tr>`;
+                    let html = `<table></table><th>股票</th><th>股數</th><th>成本</th><th>現價</th><th>盈虧</th></tr>`;
                     positions.forEach(p => {
                         let priceStr = p.price ? p.price.toFixed(2) : '--';
                         let pnlStr = p.pnl ? p.pnl.toFixed(2) : '0.00';
@@ -165,24 +251,52 @@
                     html += `</table>`;
                     document.getElementById('positionsArea').innerHTML = html;
                 }
+                const logs = data.logs || [];
+                const logDiv = document.getElementById('logArea');
+                if (logs.length === 0) {
+                    logDiv.innerHTML = '📜 尚無日誌';
+                } else {
+                    let logHtml = '';
+                    logs.slice().reverse().forEach(log => {
+                        logHtml += `<p>[${log.time}] ${log.level}: ${log.msg}</p>`;
+                    });
+                    logDiv.innerHTML = logHtml;
+                }
             })
-            .catch(err => console.error('获取状态失败', err));
+            .catch(err => console.error('獲取狀態失敗', err));
     }
 
-    function sendCommand(endpoint, confirmMsg = null) {
-        if (confirmMsg && !confirm(confirmMsg)) return;
-        fetch(endpoint, { method: 'POST' })
-            .then(res => res.json())
-            .then(data => {
-                console.log(data);
-                fetchStatus();
-            })
-            .catch(err => alert('命令发送失败: ' + err));
+    function sendCommand(endpoint, confirmMsg) {
+        if (confirmMsg) {
+            showModal(confirmMsg, () => {
+                fetch(endpoint, { method: 'POST' })
+                    .then(res => res.json())
+                    .then(data => {
+                        console.log(data);
+                        fetchStatus();
+                    })
+                    .catch(err => alert('命令發送失敗: ' + err));
+            });
+        } else {
+            fetch(endpoint, { method: 'POST' })
+                .then(res => res.json())
+                .then(data => {
+                    console.log(data);
+                    fetchStatus();
+                })
+                .catch(err => alert('命令發送失敗: ' + err));
+        }
     }
 
-    document.getElementById('btnStart').addEventListener('click', () => sendCommand('/start'));
-    document.getElementById('btnStop').addEventListener('click', () => sendCommand('/stop'));
-    document.getElementById('btnForce').addEventListener('click', () => sendCommand('/force_stop', '⚠️ 确认平仓所有持仓并停止机器人？'));
+    document.getElementById('btnStart').addEventListener('click', () => {
+        sendCommand('/start', '確定要啟動機器人嗎？');
+    });
+    document.getElementById('btnStop').addEventListener('click', () => {
+        sendCommand('/stop', '確定要停止機器人嗎？停止不會賣出任何股票，機器人將暫停交易。');
+    });
+    document.getElementById('btnForce').addEventListener('click', () => {
+        sendCommand('/force_stop', '⚠️ 確定要強制平倉所有持倉並停止機器人？此操作不可逆！');
+    });
 
     fetchStatus();
     setInterval(fetchStatus, 3000);
