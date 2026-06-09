@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>GameBoy Trading Bot</title>
+    <style>
+        * { box-sizing: border-box; user-select: none; }
+        body {
+            background: #8b8b8b;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            font-family: 'Courier New', 'VT323', monospace;
+            margin: 0;
+            padding: 20px;
+        }
+        .gameboy {
+            background: #b5b5b5;
+            border-radius: 20px;
+            box-shadow: 0 10px 0 #5a5a5a;
+            padding: 20px 20px 30px;
+            max-width: 550px;
+            width: 100%;
+        }
+        .screen {
+            background: #9bbc0f;
+            border: 5px solid #306230;
+            border-radius: 12px;
+            padding: 10px;
+            margin-bottom: 20px;
+            min-height: 320px;
+            font-family: monospace;
+            color: #0f380f;
+            font-weight: bold;
+            font-size: 14px;
+            box-shadow: inset 0 0 5px #306230;
+        }
+        .balance {
+            background: #0f380f;
+            color: #9bbc0f;
+            padding: 8px;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            text-align: center;
+            font-size: 16px;
+        }
+        .positions {
+            background: #e0f0d0;
+            padding: 8px;
+            border-radius: 8px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-size: 12px;
+        }
+        .positions table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .positions th, .positions td {
+            text-align: left;
+            padding: 4px 2px;
+            border-bottom: 1px solid #7c8c5e;
+        }
+        .controls {
+            display: flex;
+            justify-content: space-around;
+            gap: 15px;
+            margin-top: 10px;
+        }
+        button {
+            background: #4b4b4b;
+            border: none;
+            color: white;
+            font-family: inherit;
+            font-size: 18px;
+            font-weight: bold;
+            padding: 12px 16px;
+            border-radius: 50px;
+            box-shadow: 0 5px 0 #2a2a2a;
+            cursor: pointer;
+            transition: 0.05s linear;
+            flex: 1;
+            letter-spacing: 2px;
+        }
+        button:active {
+            transform: translateY(2px);
+            box-shadow: 0 2px 0 #2a2a2a;
+        }
+        button.start { background: #3a7a3a; box-shadow: 0 5px 0 #1e4a1e; }
+        button.stop { background: #aa4a4a; box-shadow: 0 5px 0 #6a2a2a; }
+        button.force { background: #aa6a2a; box-shadow: 0 5px 0 #6a3a0a; }
+        .status {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #333;
+            margin-right: 6px;
+        }
+        .status.running { background: #2ecc2e; box-shadow: 0 0 5px #2ecc2e; }
+        .status.stopped { background: #e74c3c; }
+        .refresh-note {
+            text-align: center;
+            font-size: 10px;
+            margin-top: 10px;
+            color: #306230;
+        }
+    </style>
+</head>
+<body>
+<div class="gameboy">
+    <div class="screen">
+        <div class="balance" id="balanceArea">💰 加载中...</div>
+        <div class="positions" id="positionsArea">📋 持仓列表</div>
+    </div>
+    <div class="controls">
+        <button class="start" id="btnStart">▶ 开始</button>
+        <button class="stop" id="btnStop">⏹ 停止</button>
+        <button class="force" id="btnForce">⛔ 平仓并停止</button>
+    </div>
+    <div class="refresh-note">
+        <span id="statusLed" class="status stopped"></span> 机器人状态：<span id="runStatus">已停止</span>
+    </div>
+</div>
+
+<script>
+    function fetchStatus() {
+        fetch('/status')
+            .then(res => res.json())
+            .then(data => {
+                const isRunning = data.running;
+                const led = document.getElementById('statusLed');
+                const statusText = document.getElementById('runStatus');
+                if (isRunning) {
+                    led.className = 'status running';
+                    statusText.innerText = '运行中';
+                } else {
+                    led.className = 'status stopped';
+                    statusText.innerText = '已停止';
+                }
+                const total = data.total || 0;
+                const available = data.available || 0;
+                document.getElementById('balanceArea').innerHTML = `
+                    💰 净资产: $${total.toFixed(2)} &nbsp;| 可用: $${available.toFixed(2)}
+                `;
+                const positions = data.positions || [];
+                if (positions.length === 0) {
+                    document.getElementById('positionsArea').innerHTML = '📋 暂无持仓';
+                } else {
+                    let html = `<tr><tr><th>股票</th><th>股数</th><th>成本</th><th>现价</th><th>盈亏</th></tr>`;
+                    positions.forEach(p => {
+                        let priceStr = p.price ? p.price.toFixed(2) : '--';
+                        let pnlStr = p.pnl ? p.pnl.toFixed(2) : '0.00';
+                        let pnlColor = p.pnl >= 0 ? '#2a6b2a' : '#aa4a4a';
+                        html += `<tr>
+                            <td>${p.symbol}</td>
+                            <td>${p.qty.toFixed(4)}</td>
+                            <td>${p.cost.toFixed(2)}</td>
+                            <td>${priceStr}</td>
+                            <td style="color:${pnlColor}">$${pnlStr}</td>
+                        </tr>`;
+                    });
+                    html += `</table>`;
+                    document.getElementById('positionsArea').innerHTML = html;
+                }
+            })
+            .catch(err => console.error('获取状态失败', err));
+    }
+
+    function sendCommand(endpoint, confirmMsg = null) {
+        if (confirmMsg && !confirm(confirmMsg)) return;
+        fetch(endpoint, { method: 'POST' })
+            .then(res => res.json())
+            .then(data => {
+                console.log(data);
+                fetchStatus();
+            })
+            .catch(err => alert('命令发送失败: ' + err));
+    }
+
+    document.getElementById('btnStart').addEventListener('click', () => sendCommand('/start'));
+    document.getElementById('btnStop').addEventListener('click', () => sendCommand('/stop'));
+    document.getElementById('btnForce').addEventListener('click', () => sendCommand('/force_stop', '⚠️ 确认平仓所有持仓并停止机器人？'));
+
+    fetchStatus();
+    setInterval(fetchStatus, 3000);
+</script>
+</body>
+</html>

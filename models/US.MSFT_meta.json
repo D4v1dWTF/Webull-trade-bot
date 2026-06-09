@@ -1,0 +1,10 @@
+{
+  "xgb_accuracy": 0.505,
+  "xgb_params": {
+    "n_estimators": 200,
+    "max_depth": 6,
+    "learning_rate": 0.03
+  },
+  "training_date": "2026-06-05 00:28:09",
+  "data_points": 801
+}
