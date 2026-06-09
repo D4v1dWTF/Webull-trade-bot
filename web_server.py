@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Webull 交易機器人 - 完整版（繁體中文，含日誌、確認對話框、網站圖標）
+修复：用户名显示、Keras模型加载、线程停止控制
 """
 
 import os
@@ -101,14 +102,15 @@ logger.addHandler(log_handler)
 logger.addHandler(console)
 
 # ================== 全局狀態 ==================
-running = False
+stop_event = threading.Event()          # 替代 running 标志，线程安全
 bot_thread = None
 thread_lock = threading.Lock()
 trade_client = None
 data_client = None
 models = {}
 webull_username = "未知"
-log_messages = []          # 儲存最近日誌供前端顯示
+account_id = None                       # 保存账户ID用于下单
+log_messages = []                       # 儲存最近日誌供前端顯示
 
 # ================== 輔助函數（時間） ==================
 def get_current_et() -> datetime:
@@ -161,9 +163,9 @@ logger.info = info_with_list
 logger.error = error_with_list
 logger.warning = warning_with_list
 
-# ================== Webull 客戶端初始化 ==================
-def init_webull_clients() -> Tuple[TradeClient, DataClient, str]:
-    global webull_username
+# ================== Webull 客戶端初始化（含用户名修复） ==================
+def init_webull_clients() -> Tuple[TradeClient, DataClient, str, str]:
+    global webull_username, account_id
     app_key = os.getenv("WEBULL_APP_KEY")
     app_secret = os.getenv("WEBULL_APP_SECRET")
     region_id = os.getenv("WEBULL_REGION_ID", "hk")
@@ -177,16 +179,29 @@ def init_webull_clients() -> Tuple[TradeClient, DataClient, str]:
         api_client.add_endpoint(region_id, "us-openapi-alb.uat.webullbroker.com")
     trade_client = TradeClient(api_client)
     data_client = DataClient(api_client)
-    # 獲取用戶名
+    
+    # 获取账户列表，提取 account_id
     resp = trade_client.account_v2.get_account_list()
     accounts = resp.json()
-    if accounts and len(accounts) > 0:
-        webull_username = accounts[0].get('account_name', '未知')
-    else:
+    if not accounts or len(accounts) == 0:
+        raise ValueError("未获取到账户列表")
+    account_id = accounts[0].get("account_id")
+    if not account_id:
+        raise ValueError("未找到 account_id")
+    
+    # 通过账户详情获取 account_number（显示用用户名）
+    try:
+        profile_resp = trade_client.account_v2.get_account_profile(account_id)
+        if profile_resp.status_code == 200:
+            profile_data = profile_resp.json()
+            webull_username = profile_data.get("account_number", "未知")
+        else:
+            webull_username = "未知"
+    except Exception as e:
+        logger.warning(f"获取账户 profile 失败: {e}，使用默认用户名")
         webull_username = "未知"
-    # 觸發一次帳戶查詢以確認 token 有效（會等待手機授權）
-    trade_client.account_v2.get_account_list()
-    return trade_client, data_client, webull_username
+    
+    return trade_client, data_client, webull_username, account_id
 
 # ================== 行情數據獲取 ==================
 def get_market_data(data_client: DataClient, symbol: str, count=300) -> pd.DataFrame:
@@ -245,8 +260,8 @@ def get_account_balance(trade_client: TradeClient) -> Tuple[float, float]:
         accounts = resp.json()
         if not accounts:
             return 0, 0
-        account_id = accounts[0].get("account_id")
-        bal_resp = trade_client.account_v2.get_account_balance(account_id)
+        aid = accounts[0].get("account_id")
+        bal_resp = trade_client.account_v2.get_account_balance(aid)
         bal_data = bal_resp.json()
         usd_cash = 0.0
         usd_net = 0.0
@@ -269,8 +284,8 @@ def get_positions(trade_client: TradeClient) -> pd.DataFrame:
         accounts = resp.json()
         if not accounts:
             return pd.DataFrame()
-        account_id = accounts[0].get("account_id")
-        pos_resp = trade_client.account_v2.get_account_position(account_id)
+        aid = accounts[0].get("account_id")
+        pos_resp = trade_client.account_v2.get_account_position(aid)
         positions = pos_resp.json()
         if not positions:
             return pd.DataFrame()
@@ -295,12 +310,6 @@ def place_buy_order(trade_client: TradeClient, symbol: str, amount_usd: float) -
         return False, "可用美元資金不足", None
 
     try:
-        resp = trade_client.account_v2.get_account_list()
-        accounts = resp.json()
-        if not accounts:
-            return False, "無法獲取帳戶 ID", None
-        account_id = accounts[0].get("account_id")
-
         token_file = os.path.join("conf", "token.txt")
         with open(token_file, 'r') as f:
             access_token = f.readline().strip()
@@ -381,12 +390,6 @@ def place_sell_order(trade_client: TradeClient, symbol: str, qty: float) -> Tupl
         return False, "數量無效", None
 
     try:
-        resp = trade_client.account_v2.get_account_list()
-        accounts = resp.json()
-        if not accounts:
-            return False, "無法獲取帳戶 ID", None
-        account_id = accounts[0].get("account_id")
-
         token_file = os.path.join("conf", "token.txt")
         with open(token_file, 'r') as f:
             access_token = f.readline().strip()
@@ -551,7 +554,15 @@ def compute_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     df.drop(columns=['hour', 'atr_adx', 'dx'], errors='ignore', inplace=True)
     return df.dropna().reset_index(drop=True)
 
-# ================== 模型載入（修復 Keras 兼容性） ==================
+# ================== 模型載入（兼容旧版Keras） ==================
+# 自定义 InputLayer 以忽略 batch_shape 和 optional 参数
+class CompatibleInputLayer(tf.keras.layers.InputLayer):
+    def __init__(self, **kwargs):
+        # 移除不兼容的参数
+        kwargs.pop('batch_shape', None)
+        kwargs.pop('optional', None)
+        super().__init__(**kwargs)
+
 def load_models() -> Dict[str, Tuple]:
     models_dict = {}
     for symbol in SYMBOLS:
@@ -563,18 +574,32 @@ def load_models() -> Dict[str, Tuple]:
             continue
         with open(xgb_path, 'rb') as f:
             xgb_model = pickle.load(f)
+        
+        # 尝试加载 LSTM 模型，兼容旧格式
+        lstm_model = None
         try:
+            # 方法1: 正常加载
             lstm_model = tf.keras.models.load_model(lstm_path, compile=False)
-        except TypeError:
-            logger.warning(f"載入 LSTM {symbol} 失敗，嘗試自訂物件")
-            try:
-                lstm_model = tf.keras.models.load_model(lstm_path, compile=False, custom_objects={'InputLayer': tf.keras.layers.InputLayer})
-            except Exception as e2:
-                logger.error(f"仍無法載入 {symbol} LSTM: {e2}，跳過此股票")
+        except TypeError as e:
+            if 'batch_shape' in str(e) or 'optional' in str(e):
+                logger.warning(f"偵測到版本兼容問題，使用自定義 InputLayer 加載 {symbol}")
+                try:
+                    # 方法2: 使用自定义 InputLayer 忽略多余参数
+                    lstm_model = tf.keras.models.load_model(
+                        lstm_path,
+                        compile=False,
+                        custom_objects={'InputLayer': CompatibleInputLayer}
+                    )
+                except Exception as e2:
+                    logger.error(f"自定義加載仍然失敗 {symbol}: {e2}，跳過此股票")
+                    continue
+            else:
+                logger.error(f"加載 {symbol} LSTM 錯誤: {e}，跳過")
                 continue
         except Exception as e:
-            logger.error(f"載入 {symbol} LSTM 錯誤: {e}，跳過")
+            logger.error(f"加載 {symbol} LSTM 錯誤: {e}，跳過")
             continue
+        
         with open(scaler_path, 'rb') as f:
             scaler = pickle.load(f)
         models_dict[symbol] = (xgb_model, lstm_model, scaler)
@@ -657,9 +682,9 @@ def force_close_all(trade_client: TradeClient):
         logger.info(f"強制平倉: {symbol} {qty:.4f} 股")
         place_sell_order(trade_client, symbol, qty)
 
-# ================== 機器人主循環 ==================
+# ================== 機器人主循環（支持安全停止） ==================
 def bot_loop():
-    global running, trade_client, data_client, models
+    global stop_event, trade_client, data_client, models
     logger.info("機器人執行緒啟動，開始交易循環")
     tracker = PositionTracker()
     # 同步現有持倉
@@ -674,19 +699,23 @@ def bot_loop():
             logger.info(f"同步現有持倉 {symbol} 成本 {cost:.2f}")
 
     try:
-        while running:
+        while not stop_event.is_set():
             now_et = get_current_et()
             now_time = now_et.time()
             market_open = is_us_market_open()
             if not market_open:
-                time.sleep(CHECK_INTERVAL_SEC)
+                # 非交易时段，等待并检查停止事件
+                for _ in range(CHECK_INTERVAL_SEC):
+                    if stop_event.is_set():
+                        break
+                    time.sleep(1)
                 continue
 
             if is_force_sell_time(now_time):
                 logger.info("到達強制平倉時間 15:15，平倉所有持倉")
                 force_close_all(trade_client)
-                with thread_lock:
-                    running = False
+                # 强制平仓后停止机器人
+                stop_event.set()
                 break
 
             total, available = get_account_balance(trade_client)
@@ -694,7 +723,7 @@ def bot_loop():
             current_holdings = {row['symbol']: row['qty'] for _, row in pos_df.iterrows()}
 
             for symbol in SYMBOLS:
-                if not running:
+                if stop_event.is_set():
                     break
                 if symbol not in models:
                     continue
@@ -751,7 +780,11 @@ def bot_loop():
                 time.sleep(0.8)
 
             logger.info("完成一輪掃描，等待5秒")
-            time.sleep(CHECK_INTERVAL_SEC)
+            # 分段等待，以便及时响应停止信号
+            for _ in range(CHECK_INTERVAL_SEC):
+                if stop_event.is_set():
+                    break
+                time.sleep(1)
     except Exception as e:
         logger.exception(f"機器人循環異常: {e}")
     finally:
@@ -770,8 +803,7 @@ def index():
 
 @app.route('/status')
 def status():
-    with thread_lock:
-        is_running = running
+    is_running = not stop_event.is_set() and bot_thread is not None and bot_thread.is_alive()
     if trade_client is None:
         return jsonify({"running": is_running, "total": 0, "available": 0, "positions": [], "username": webull_username, "logs": log_messages[-50:]})
     try:
@@ -798,49 +830,46 @@ def status():
 
 @app.route('/start', methods=['POST'])
 def start_bot():
-    global running, bot_thread, trade_client, data_client, models, webull_username
+    global bot_thread, stop_event, trade_client, data_client, models, webull_username, account_id
     with thread_lock:
-        if running:
+        # 如果已经有线程在运行且未停止，则拒绝启动
+        if bot_thread is not None and bot_thread.is_alive() and not stop_event.is_set():
             return jsonify({"status": "already running"})
+        # 初始化客户端和模型
         if trade_client is None:
             try:
-                trade_client, data_client, webull_username = init_webull_clients()
+                trade_client, data_client, webull_username, account_id = init_webull_clients()
                 models = load_models()
                 if not models:
                     raise ValueError("無法載入任何模型，請檢查 models 目錄")
             except Exception as e:
                 logger.exception("初始化失敗")
                 return jsonify({"status": "init failed", "error": str(e)}), 500
-        running = True
+        # 重置停止事件
+        stop_event.clear()
         bot_thread = threading.Thread(target=bot_loop, daemon=True)
         bot_thread.start()
     return jsonify({"status": "started"})
 
 @app.route('/stop', methods=['POST'])
 def stop_bot():
-    global running, bot_thread
+    global stop_event
     with thread_lock:
-        if not running:
-            return jsonify({"status": "not running"})
-        running = False
-    if bot_thread and bot_thread.is_alive():
-        bot_thread.join(timeout=10)
-    return jsonify({"status": "stopped"})
+        stop_event.set()
+    return jsonify({"status": "stopping"})
 
 @app.route('/force_stop', methods=['POST'])
 def force_stop():
-    global running, bot_thread, trade_client
+    global trade_client, stop_event
     if trade_client is None:
         return jsonify({"status": "trade client not ready"})
     force_close_all(trade_client)
     with thread_lock:
-        running = False
-    if bot_thread and bot_thread.is_alive():
-        bot_thread.join(timeout=10)
+        stop_event.set()
     return jsonify({"status": "force stopped and liquidated"})
 
 if __name__ == '__main__':
     os.makedirs("conf", exist_ok=True)
-    os.makedirs("static", exist_ok=True)   # 確保 static 資料夾存在
+    os.makedirs("static", exist_ok=True)
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
