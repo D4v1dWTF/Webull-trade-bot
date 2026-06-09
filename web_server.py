@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Webull 交易機器人 - 完整版（繁體中文，含日誌、確認對話框、網站圖標）
-修复：用户名显示、Keras模型加载、线程停止控制
+Webull 交易機器人 - 完整版（繁體中文，含日誌過濾、線程安全停止）
 """
 
+# 強制使用舊版 Keras 相容模式（解決 DTypePolicy 錯誤）
 import os
+os.environ['TF_USE_LEGACY_KERAS'] = '1'
+
 import sys
 import time
 import pickle
@@ -34,7 +36,6 @@ from webull.trade.trade_client import TradeClient
 from webull.data.data_client import DataClient
 from webull.data.common.category import Category
 from webull.data.common.timespan import Timespan
-from webull.core.exception.exceptions import ServerException
 
 load_dotenv()
 
@@ -86,7 +87,7 @@ FEATURES = [
     'obv', 'obv_ratio', 'mfi'
 ]
 
-# ================== 日誌 ==================
+# ================== 日誌（分離前端與檔案） ==================
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 log_handler = TimedRotatingFileHandler(
@@ -101,16 +102,66 @@ logger.setLevel(logging.INFO)
 logger.addHandler(log_handler)
 logger.addHandler(console)
 
+# 前端日誌列表（只存放交易相關訊息）
+ui_log_messages = []
+
+def add_ui_log(level: str, msg: str):
+    """只加入與交易決策相關的日誌（股票分析、買賣訊號）"""
+    # 定義要顯示的關鍵字（只要包含任一關鍵字就顯示）
+    keywords = [
+        '分析', '上漲概率', '買入信號', '賣出', '止損', '止盈', '平倉',
+        '死叉賣出', 'ATR移動止損', '硬止損', '智能賣出', 'ML止盈',
+        '成功', '訂單'
+    ]
+    # 排除的關鍵字（資產查詢等）
+    exclude_keywords = ['美元淨資產', '可用現金', '載入模型', '版本兼容', '錯誤', '警告', '初始化']
+    
+    if any(k in msg for k in exclude_keywords):
+        return
+    if level == 'INFO' and any(k in msg for k in keywords):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ui_log_messages.append({"time": timestamp, "level": level, "msg": msg})
+        while len(ui_log_messages) > 500:
+            ui_log_messages.pop(0)
+    elif level in ('ERROR', 'WARNING') and '訂單' not in msg:
+        # 不顯示錯誤警告在前端（但可顯示訂單失敗）
+        pass
+    else:
+        # 其他 INFO 如訂單成功也顯示
+        if '訂單' in msg or '強制平倉' in msg:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ui_log_messages.append({"time": timestamp, "level": level, "msg": msg})
+            while len(ui_log_messages) > 500:
+                ui_log_messages.pop(0)
+
+# 覆蓋 logger 方法，同時寫入檔案/主控台，並選擇性加入前端
+original_info = logger.info
+original_error = logger.error
+original_warning = logger.warning
+
+def info_with_ui(msg, *args, **kwargs):
+    original_info(msg, *args, **kwargs)
+    add_ui_log("INFO", msg)
+def error_with_ui(msg, *args, **kwargs):
+    original_error(msg, *args, **kwargs)
+    add_ui_log("ERROR", msg)
+def warning_with_ui(msg, *args, **kwargs):
+    original_warning(msg, *args, **kwargs)
+    add_ui_log("WARNING", msg)
+
+logger.info = info_with_ui
+logger.error = error_with_ui
+logger.warning = warning_with_ui
+
 # ================== 全局狀態 ==================
-stop_event = threading.Event()          # 替代 running 标志，线程安全
+stop_event = threading.Event()
 bot_thread = None
 thread_lock = threading.Lock()
 trade_client = None
 data_client = None
 models = {}
 webull_username = "未知"
-account_id = None                       # 保存账户ID用于下单
-log_messages = []                       # 儲存最近日誌供前端顯示
+account_id = None
 
 # ================== 輔助函數（時間） ==================
 def get_current_et() -> datetime:
@@ -137,33 +188,7 @@ def is_sell_allowed(now_time: dt_time) -> bool:
 def is_force_sell_time(now_time: dt_time) -> bool:
     return now_time >= FORCE_SELL_TIME
 
-def add_log(level: str, msg: str):
-    """將日誌同時儲存到記憶體列表供前端顯示"""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_messages.append({"time": timestamp, "level": level, "msg": msg})
-    while len(log_messages) > 500:
-        log_messages.pop(0)
-
-# 覆蓋 logger 方法
-original_info = logger.info
-original_error = logger.error
-original_warning = logger.warning
-
-def info_with_list(msg, *args, **kwargs):
-    original_info(msg, *args, **kwargs)
-    add_log("INFO", msg)
-def error_with_list(msg, *args, **kwargs):
-    original_error(msg, *args, **kwargs)
-    add_log("ERROR", msg)
-def warning_with_list(msg, *args, **kwargs):
-    original_warning(msg, *args, **kwargs)
-    add_log("WARNING", msg)
-
-logger.info = info_with_list
-logger.error = error_with_list
-logger.warning = warning_with_list
-
-# ================== Webull 客戶端初始化（含用户名修复） ==================
+# ================== Webull 客戶端初始化 ==================
 def init_webull_clients() -> Tuple[TradeClient, DataClient, str, str]:
     global webull_username, account_id
     app_key = os.getenv("WEBULL_APP_KEY")
@@ -180,16 +205,16 @@ def init_webull_clients() -> Tuple[TradeClient, DataClient, str, str]:
     trade_client = TradeClient(api_client)
     data_client = DataClient(api_client)
     
-    # 获取账户列表，提取 account_id
+    # 獲取 account_id
     resp = trade_client.account_v2.get_account_list()
     accounts = resp.json()
-    if not accounts or len(accounts) == 0:
-        raise ValueError("未获取到账户列表")
+    if not accounts:
+        raise ValueError("無法獲取帳戶列表")
     account_id = accounts[0].get("account_id")
     if not account_id:
-        raise ValueError("未找到 account_id")
+        raise ValueError("account_id 不存在")
     
-    # 通过账户详情获取 account_number（显示用用户名）
+    # 獲取帳號名稱
     try:
         profile_resp = trade_client.account_v2.get_account_profile(account_id)
         if profile_resp.status_code == 200:
@@ -197,8 +222,7 @@ def init_webull_clients() -> Tuple[TradeClient, DataClient, str, str]:
             webull_username = profile_data.get("account_number", "未知")
         else:
             webull_username = "未知"
-    except Exception as e:
-        logger.warning(f"获取账户 profile 失败: {e}，使用默认用户名")
+    except Exception:
         webull_username = "未知"
     
     return trade_client, data_client, webull_username, account_id
@@ -235,10 +259,10 @@ def get_market_data(data_client: DataClient, symbol: str, count=300) -> pd.DataF
                     df[col] = pd.to_numeric(df[col], errors='coerce')
             return df.sort_values('time_key').reset_index(drop=True)
         else:
-            logger.error(f"獲取 {symbol} K線失敗 HTTP {res.status_code}: {res.text[:200]}")
+            logger.warning(f"獲取 {symbol} K線失敗 HTTP {res.status_code}")
             return pd.DataFrame()
     except Exception as e:
-        logger.error(f"獲取 {symbol} K線異常: {e}")
+        logger.warning(f"獲取 {symbol} K線異常: {e}")
         return pd.DataFrame()
 
 def get_real_time_price(data_client: DataClient, symbol: str) -> Optional[float]:
@@ -253,7 +277,7 @@ def get_real_time_price(data_client: DataClient, symbol: str) -> Optional[float]
     except Exception:
         return None
 
-# ================== 帳戶與持倉 ==================
+# ================== 帳戶與持倉（修改日誌層級避免前端雜訊） ==================
 def get_account_balance(trade_client: TradeClient) -> Tuple[float, float]:
     try:
         resp = trade_client.account_v2.get_account_list()
@@ -272,7 +296,8 @@ def get_account_balance(trade_client: TradeClient) -> Tuple[float, float]:
                     usd_net = float(asset.get("net_liquidation_value", 0))
                     break
         available = max(usd_cash - RESERVED_FEE_PER_TRADE, 0)
-        logger.info(f"💰 美元淨資產: ${usd_net:,.2f}, 可用現金: ${available:,.2f}")
+        # 改為 debug 層級，避免前端顯示
+        logger.debug(f"美元淨資產: ${usd_net:,.2f}, 可用現金: ${available:,.2f}")
         return usd_net, available
     except Exception as e:
         logger.error(f"獲取帳戶餘額失敗: {e}")
@@ -301,7 +326,7 @@ def get_positions(trade_client: TradeClient) -> pd.DataFrame:
         logger.debug(f"獲取持倉時臨時錯誤: {e}")
         return pd.DataFrame()
 
-# ================== 下單（HTTP） ==================
+# ================== 下單 ==================
 def place_buy_order(trade_client: TradeClient, symbol: str, amount_usd: float) -> Tuple[bool, str, Optional[str]]:
     if amount_usd < 5.0:
         return False, f"買入金額 ${amount_usd:.2f} < 5 美元", None
@@ -468,65 +493,53 @@ def place_sell_order(trade_client: TradeClient, symbol: str, qty: float) -> Tupl
 # ================== 技術指標 ==================
 def compute_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # 收益率
     df['return_1d'] = df['close'].pct_change(1)
     df['return_5d'] = df['close'].pct_change(5)
     df['return_10d'] = df['close'].pct_change(10)
     df['return_20d'] = df['close'].pct_change(20)
-
     for period in [5, 10, 20, 50, 200]:
         df[f'sma{period}'] = df['close'].rolling(period).mean()
     df['sma5_sma20_ratio'] = df['sma5'] / df['sma20'] - 1
     df['sma10_sma50_ratio'] = df['sma10'] / df['sma50'] - 1
     df['close_sma20_ratio'] = df['close'] / df['sma20'] - 1
     df['close_sma50_ratio'] = df['close'] / df['sma50'] - 1
-
     for period in [7, 14, 21]:
         delta = df['close'].diff()
         gain = delta.where(delta > 0, 0).rolling(period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
         rs = gain / loss
         df[f'rsi_{period}'] = 100 - (100 / (1 + rs))
-
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
     low_close = (df['low'] - df['close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['atr'] = tr.rolling(ATR_PERIOD).mean()
     df['atr_pct'] = df['atr'] / df['close']
-
     df['bb_mid'] = df['close'].rolling(20).mean()
     df['bb_std'] = df['close'].rolling(20).std()
     df['bb_width'] = (2 * df['bb_std']) / df['bb_mid']
     df['bb_position'] = (df['close'] - df['bb_mid']) / (2 * df['bb_std'] + 1e-8)
-
     exp1 = df['close'].ewm(span=12, adjust=False).mean()
     exp2 = df['close'].ewm(span=26, adjust=False).mean()
     df['macd'] = exp1 - exp2
     df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
     df['macd_diff'] = df['macd'] - df['macd_signal']
-
     df['volume_ma'] = df['volume'].rolling(20).mean()
     df['volume_ratio'] = df['volume'] / (df['volume_ma'] + 1e-8)
     df['volume_ma_ratio'] = df['volume_ma'] / (df['volume_ma'].shift(1) + 1e-8) - 1
-
     df['vwap'] = (df['volume'] * df['close']).rolling(20).sum() / (df['volume'].rolling(20).sum() + 1e-8)
     df['vwap_ratio'] = df['close'] / df['vwap'] - 1
-
     df['body_ratio'] = abs(df['close'] - df['open']) / (df['high'] - df['low'] + 1e-8)
     df['upper_shadow_ratio'] = (df['high'] - df[['close', 'open']].max(axis=1)) / (df['high'] - df['low'] + 1e-8)
     df['lower_shadow_ratio'] = (df[['close', 'open']].min(axis=1) - df['low']) / (df['high'] - df['low'] + 1e-8)
     df['high_low_ratio'] = (df['high'] - df['low']) / df['close']
     df['open_close_ratio'] = (df['close'] - df['open']) / df['open']
-
     df['volatility_10'] = df['return_1d'].rolling(10).std()
     df['volatility_20'] = df['return_1d'].rolling(20).std()
-
     df['time_key'] = pd.to_datetime(df['time_key'])
     df['hour'] = df['time_key'].dt.hour
     df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
     df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
-
     df['atr_adx'] = tr.rolling(14).mean()
     df['plus_dm'] = ((df['high'] - df['high'].shift(1)) > (df['low'].shift(1) - df['low'])) * (df['high'] - df['high'].shift(1)).clip(lower=0)
     df['minus_dm'] = ((df['low'].shift(1) - df['low']) > (df['high'] - df['high'].shift(1))) * (df['low'].shift(1) - df['low']).clip(lower=0)
@@ -534,15 +547,12 @@ def compute_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     df['minus_di'] = 100 * (df['minus_dm'].rolling(14).mean() / (df['atr_adx'] + 1e-8))
     df['dx'] = 100 * abs(df['plus_di'] - df['minus_di']) / (df['plus_di'] + df['minus_di'] + 1e-8)
     df['adx'] = df['dx'].rolling(14).mean()
-
     df['golden_cross_5_20'] = ((df['sma5'] > df['sma20']) & (df['sma5'].shift(1) <= df['sma20'].shift(1))).astype(int)
     df['death_cross_5_20'] = ((df['sma5'] < df['sma20']) & (df['sma5'].shift(1) >= df['sma20'].shift(1))).astype(int)
     df['golden_cross_20_50'] = ((df['sma20'] > df['sma50']) & (df['sma20'].shift(1) <= df['sma50'].shift(1))).astype(int)
     df['death_cross_20_50'] = ((df['sma20'] < df['sma50']) & (df['sma20'].shift(1) >= df['sma50'].shift(1))).astype(int)
-
     df['williams_r'] = -100 * (df['high'].rolling(14).max() - df['close']) / (df['high'].rolling(14).max() - df['low'].rolling(14).min() + 1e-8)
     df['cci'] = (df['close'] - df['close'].rolling(20).mean()) / (0.015 * df['close'].rolling(20).std() + 1e-8)
-
     df['obv'] = (np.sign(df['close'].diff()) * df['volume']).cumsum()
     df['obv_ratio'] = df['obv'] / (df['obv'].abs().max() + 1e-8)
     tp = (df['high'] + df['low'] + df['close']) / 3
@@ -550,19 +560,10 @@ def compute_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     pos_flow = money_flow.where(df['close'] > df['close'].shift(1), 0).rolling(14).sum()
     neg_flow = money_flow.where(df['close'] < df['close'].shift(1), 0).rolling(14).sum()
     df['mfi'] = 100 - 100 / (1 + pos_flow / (neg_flow + 1e-8))
-
     df.drop(columns=['hour', 'atr_adx', 'dx'], errors='ignore', inplace=True)
     return df.dropna().reset_index(drop=True)
 
-# ================== 模型載入（兼容旧版Keras） ==================
-# 自定义 InputLayer 以忽略 batch_shape 和 optional 参数
-class CompatibleInputLayer(tf.keras.layers.InputLayer):
-    def __init__(self, **kwargs):
-        # 移除不兼容的参数
-        kwargs.pop('batch_shape', None)
-        kwargs.pop('optional', None)
-        super().__init__(**kwargs)
-
+# ================== 模型載入（使用舊版相容模式） ==================
 def load_models() -> Dict[str, Tuple]:
     models_dict = {}
     for symbol in SYMBOLS:
@@ -574,32 +575,11 @@ def load_models() -> Dict[str, Tuple]:
             continue
         with open(xgb_path, 'rb') as f:
             xgb_model = pickle.load(f)
-        
-        # 尝试加载 LSTM 模型，兼容旧格式
-        lstm_model = None
         try:
-            # 方法1: 正常加载
             lstm_model = tf.keras.models.load_model(lstm_path, compile=False)
-        except TypeError as e:
-            if 'batch_shape' in str(e) or 'optional' in str(e):
-                logger.warning(f"偵測到版本兼容問題，使用自定義 InputLayer 加載 {symbol}")
-                try:
-                    # 方法2: 使用自定义 InputLayer 忽略多余参数
-                    lstm_model = tf.keras.models.load_model(
-                        lstm_path,
-                        compile=False,
-                        custom_objects={'InputLayer': CompatibleInputLayer}
-                    )
-                except Exception as e2:
-                    logger.error(f"自定義加載仍然失敗 {symbol}: {e2}，跳過此股票")
-                    continue
-            else:
-                logger.error(f"加載 {symbol} LSTM 錯誤: {e}，跳過")
-                continue
         except Exception as e:
-            logger.error(f"加載 {symbol} LSTM 錯誤: {e}，跳過")
+            logger.error(f"載入 {symbol} LSTM 失敗: {e}，跳過此股票")
             continue
-        
         with open(scaler_path, 'rb') as f:
             scaler = pickle.load(f)
         models_dict[symbol] = (xgb_model, lstm_model, scaler)
@@ -682,7 +662,7 @@ def force_close_all(trade_client: TradeClient):
         logger.info(f"強制平倉: {symbol} {qty:.4f} 股")
         place_sell_order(trade_client, symbol, qty)
 
-# ================== 機器人主循環（支持安全停止） ==================
+# ================== 機器人主循環 ==================
 def bot_loop():
     global stop_event, trade_client, data_client, models
     logger.info("機器人執行緒啟動，開始交易循環")
@@ -704,7 +684,6 @@ def bot_loop():
             now_time = now_et.time()
             market_open = is_us_market_open()
             if not market_open:
-                # 非交易时段，等待并检查停止事件
                 for _ in range(CHECK_INTERVAL_SEC):
                     if stop_event.is_set():
                         break
@@ -714,7 +693,6 @@ def bot_loop():
             if is_force_sell_time(now_time):
                 logger.info("到達強制平倉時間 15:15，平倉所有持倉")
                 force_close_all(trade_client)
-                # 强制平仓后停止机器人
                 stop_event.set()
                 break
 
@@ -780,7 +758,6 @@ def bot_loop():
                 time.sleep(0.8)
 
             logger.info("完成一輪掃描，等待5秒")
-            # 分段等待，以便及时响应停止信号
             for _ in range(CHECK_INTERVAL_SEC):
                 if stop_event.is_set():
                     break
@@ -795,7 +772,8 @@ app = Flask(__name__)
 
 @app.route('/favicon.ico')
 def favicon():
-    return send_from_directory(os.path.join(app.root_path, 'static'), 'favicon.ico', mimetype='image/vnd.microsoft.icon')
+    # 內嵌一個簡單的圖標回應，避免404
+    return '', 204
 
 @app.route('/')
 def index():
@@ -805,7 +783,14 @@ def index():
 def status():
     is_running = not stop_event.is_set() and bot_thread is not None and bot_thread.is_alive()
     if trade_client is None:
-        return jsonify({"running": is_running, "total": 0, "available": 0, "positions": [], "username": webull_username, "logs": log_messages[-50:]})
+        return jsonify({
+            "running": is_running,
+            "total": 0,
+            "available": 0,
+            "positions": [],
+            "username": webull_username,
+            "logs": ui_log_messages[-50:]
+        })
     try:
         total, available = get_account_balance(trade_client)
         pos_df = get_positions(trade_client)
@@ -823,7 +808,14 @@ def status():
                 'price': price,
                 'pnl': pnl
             })
-        return jsonify({"running": is_running, "total": total, "available": available, "positions": positions, "username": webull_username, "logs": log_messages[-50:]})
+        return jsonify({
+            "running": is_running,
+            "total": total,
+            "available": available,
+            "positions": positions,
+            "username": webull_username,
+            "logs": ui_log_messages[-50:]
+        })
     except Exception as e:
         logger.exception("獲取狀態失敗")
         return jsonify({"error": str(e)}), 500
@@ -832,10 +824,8 @@ def status():
 def start_bot():
     global bot_thread, stop_event, trade_client, data_client, models, webull_username, account_id
     with thread_lock:
-        # 如果已经有线程在运行且未停止，则拒绝启动
         if bot_thread is not None and bot_thread.is_alive() and not stop_event.is_set():
             return jsonify({"status": "already running"})
-        # 初始化客户端和模型
         if trade_client is None:
             try:
                 trade_client, data_client, webull_username, account_id = init_webull_clients()
@@ -845,7 +835,6 @@ def start_bot():
             except Exception as e:
                 logger.exception("初始化失敗")
                 return jsonify({"status": "init failed", "error": str(e)}), 500
-        # 重置停止事件
         stop_event.clear()
         bot_thread = threading.Thread(target=bot_loop, daemon=True)
         bot_thread.start()
