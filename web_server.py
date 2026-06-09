@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Webull 交易機器人 - 完整版（含前端狀態日誌、免責聲明、錯誤自動停止）
+Webull 交易機器人 - 完整版（修正 DTypePolicy 載入錯誤）
 """
 
 import os
@@ -126,20 +126,16 @@ def translate_warning(msg: str) -> str:
 
 def add_ui_log(level: str, msg: str):
     """前端日誌過濾：只排除資產查詢等雜訊，保留所有狀態、交易、錯誤訊息"""
-    # 只排除包含資產查詢的訊息（這些會頻繁出現且對用戶無用）
     exclude_keywords = ['美元淨資產', '可用現金']
     
-    # 若是排除關鍵字則直接返回
     if any(k in msg for k in exclude_keywords):
         return
     
-    # 警告轉譯
     if level == 'WARNING':
         msg = translate_warning(msg)
     elif level == 'ERROR':
         msg = f"❌ 錯誤：{msg}"
     
-    # 所有其他訊息都顯示在前端（INFO、WARNING、ERROR）
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ui_log_messages.append({"time": timestamp, "level": level, "msg": msg})
     while len(ui_log_messages) > 500:
@@ -588,8 +584,12 @@ class CompatibleInputLayer(tf.keras.layers.InputLayer):
         super().__init__(**kwargs)
 
 class DummyDTypePolicy:
+    """模擬舊版 dtype policy，提供必要的 name 屬性"""
     def __init__(self, *args, **kwargs):
         pass
+    @property
+    def name(self):
+        return "float32"
 
 def load_models() -> Dict[str, Tuple]:
     models_dict = {}
@@ -712,15 +712,12 @@ def bot_loop():
     logger.info("機器人執行緒啟動，開始交易循環")
     tracker = PositionTracker()
     
-    # 用於控制非交易時段提示頻率
     last_waiting_msg_time = 0
-    # 記錄上次時間段狀態，用於觸發一次性的模式切換訊息
     last_high_conf_mode = False
     last_stop_buy_mode = False
     last_start_sell_mode = False
     last_force_sell_mode = False
     
-    # 同步現有持倉
     try:
         pos_df = get_positions(trade_client)
         for _, row in pos_df.iterrows():
@@ -742,7 +739,6 @@ def bot_loop():
                 now_et = get_current_et()
                 now_time = now_et.time()
                 
-                # 檢查並輸出模式切換訊息（只在狀態變化時輸出一次）
                 high_conf_active = now_time >= HIGH_CONFIDENCE_START_TIME
                 stop_buy_active = now_time >= STOP_BUY_TIME
                 start_sell_active = now_time >= START_SELL_TIME
@@ -768,7 +764,6 @@ def bot_loop():
                 
                 market_open = is_us_market_open()
                 if not market_open:
-                    # 非交易時段每 60 秒顯示一次等待訊息
                     if time.time() - last_waiting_msg_time > 60:
                         logger.info("⏳ 美股尚未開盤（美東時間 9:30-16:00），機器人等待中...")
                         last_waiting_msg_time = time.time()
@@ -778,14 +773,11 @@ def bot_loop():
                         time.sleep(1)
                     continue
                 else:
-                    # 交易時段重置等待計時器，避免一開盤立刻輸出等待訊息
                     last_waiting_msg_time = 0
-                    # 如果剛才從非交易時段進入，可輸出開盤訊息
                     if not hasattr(bot_loop, "_market_open_just_entered"):
                         logger.info("📈 美股已開盤，機器人開始掃描標的")
                         bot_loop._market_open_just_entered = True
                 
-                # 強制平倉判斷（已包含在模式切換中，但這裡仍保留原有邏輯）
                 if is_force_sell_time(now_time):
                     logger.info("到達強制平倉時間 15:15，平倉所有持倉")
                     force_close_all(trade_client)
@@ -813,7 +805,6 @@ def bot_loop():
 
                     holding_qty = current_holdings.get(symbol, 0)
 
-                    # 賣出邏輯
                     if holding_qty > 0:
                         should_sell, reason, qty = check_exit_conditions(
                             tracker, trade_client, data_client, symbol, current_price, df, sell_prob, now_time
@@ -828,7 +819,6 @@ def bot_loop():
                                 logger.error(f"賣出失敗: {msg}")
                             continue
 
-                    # 買入邏輯
                     if holding_qty == 0:
                         if is_buy_allowed(now_time, buy_prob):
                             if available <= 0:
@@ -1119,7 +1109,7 @@ HTML_TEMPLATE = '''
                 if (positions.length === 0) {
                     document.getElementById('positionsArea').innerHTML = '📋 暫無持倉';
                 } else {
-                    let html = `<table><tr><th>股票</th><th>股數</th><th>成本</th><th>現價</th><th>盈虧</th></tr>`;
+                    let html = `<table><th>股票</th><th>股數</th><th>成本</th><th>現價</th><th>盈虧</th></tr>`;
                     positions.forEach(p => {
                         let priceStr = p.price ? p.price.toFixed(2) : '--';
                         let pnlStr = p.pnl ? p.pnl.toFixed(2) : '0.00';
