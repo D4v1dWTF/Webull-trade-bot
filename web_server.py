@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Webull 交易機器人 - 完整版（內嵌 HTML、免責聲明、日誌過濾、錯誤自動停止）
+Webull 交易機器人 - 完整版（含前端狀態日誌、免責聲明、錯誤自動停止）
 """
 
-# 強制使用舊版 Keras 相容模式
 import os
 os.environ['TF_USE_LEGACY_KERAS'] = '1'
 
@@ -20,7 +19,6 @@ import hmac
 import base64
 import threading
 import requests
-import traceback
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, time as dt_time, timezone
 from zoneinfo import ZoneInfo
@@ -127,35 +125,25 @@ def translate_warning(msg: str) -> str:
     return f"⚠️ {msg}"
 
 def add_ui_log(level: str, msg: str):
-    exclude_keywords = [
-        '美元淨資產', '可用現金', '載入模型', '版本兼容',
-        '初始化失敗', '跳過此股票', '無法載入任何模型'
-    ]
-    keywords = [
-        '分析', '上漲概率', '買入信號', '賣出', '止損', '止盈', '平倉',
-        '死叉賣出', 'ATR移動止損', '硬止損', '智能賣出', 'ML止盈',
-        '成功', '訂單', '強制平倉', '機器人已停止', '機器人啟動',
-        '強制平倉時間', '到達強制平倉時間', '交易時段'
-    ]
+    """前端日誌過濾：只排除資產查詢等雜訊，保留所有狀態、交易、錯誤訊息"""
+    # 只排除包含資產查詢的訊息（這些會頻繁出現且對用戶無用）
+    exclude_keywords = ['美元淨資產', '可用現金']
     
+    # 若是排除關鍵字則直接返回
     if any(k in msg for k in exclude_keywords):
         return
     
+    # 警告轉譯
     if level == 'WARNING':
         msg = translate_warning(msg)
     elif level == 'ERROR':
         msg = f"❌ 錯誤：{msg}"
     
-    if level in ('WARNING', 'ERROR'):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ui_log_messages.append({"time": timestamp, "level": level, "msg": msg})
-        while len(ui_log_messages) > 500:
-            ui_log_messages.pop(0)
-    elif level == 'INFO' and any(k in msg for k in keywords):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ui_log_messages.append({"time": timestamp, "level": level, "msg": msg})
-        while len(ui_log_messages) > 500:
-            ui_log_messages.pop(0)
+    # 所有其他訊息都顯示在前端（INFO、WARNING、ERROR）
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ui_log_messages.append({"time": timestamp, "level": level, "msg": msg})
+    while len(ui_log_messages) > 500:
+        ui_log_messages.pop(0)
 
 # 覆蓋 logger
 original_info = logger.info
@@ -219,6 +207,7 @@ def is_force_sell_time(now_time: dt_time) -> bool:
 # ================== Webull 客戶端初始化 ==================
 def init_webull_clients() -> Tuple[TradeClient, DataClient, str, str]:
     global webull_username, account_id
+    logger.info("正在初始化 Webull 客戶端...")
     app_key = os.getenv("WEBULL_APP_KEY")
     app_secret = os.getenv("WEBULL_APP_SECRET")
     region_id = os.getenv("WEBULL_REGION_ID", "hk")
@@ -246,10 +235,13 @@ def init_webull_clients() -> Tuple[TradeClient, DataClient, str, str]:
         if profile_resp.status_code == 200:
             profile_data = profile_resp.json()
             webull_username = profile_data.get("account_number", "未知")
+            logger.info(f"Webull 連線成功，帳戶：{webull_username}")
         else:
             webull_username = "未知"
-    except Exception:
+            logger.warning("無法取得帳戶名稱")
+    except Exception as e:
         webull_username = "未知"
+        logger.warning(f"取得帳戶名稱失敗: {e}")
     
     return trade_client, data_client, webull_username, account_id
 
@@ -601,6 +593,7 @@ class DummyDTypePolicy:
 
 def load_models() -> Dict[str, Tuple]:
     models_dict = {}
+    logger.info("開始載入模型...")
     for symbol in SYMBOLS:
         xgb_path = f"models/US.{symbol}_xgb.pkl"
         lstm_path = f"models/US.{symbol}_lstm.h5"
@@ -634,6 +627,7 @@ def load_models() -> Dict[str, Tuple]:
             scaler = pickle.load(f)
         models_dict[symbol] = (xgb_model, lstm_model, scaler)
         logger.info(f"成功載入模型: {symbol}")
+    logger.info(f"模型載入完成，共 {len(models_dict)} 支股票")
     return models_dict
 
 def predict_probability(data_client: DataClient, symbol: str, xgb_model, lstm_model, scaler) -> float:
@@ -712,11 +706,19 @@ def force_close_all(trade_client: TradeClient):
         logger.info(f"強制平倉: {symbol} {qty:.4f} 股")
         place_sell_order(trade_client, symbol, qty)
 
-# ================== 機器人主循環（含嚴重錯誤自動停止） ==================
+# ================== 機器人主循環（含狀態提示） ==================
 def bot_loop():
     global stop_event, trade_client, data_client, models
     logger.info("機器人執行緒啟動，開始交易循環")
     tracker = PositionTracker()
+    
+    # 用於控制非交易時段提示頻率
+    last_waiting_msg_time = 0
+    # 記錄上次時間段狀態，用於觸發一次性的模式切換訊息
+    last_high_conf_mode = False
+    last_stop_buy_mode = False
+    last_start_sell_mode = False
+    last_force_sell_mode = False
     
     # 同步現有持倉
     try:
@@ -739,14 +741,51 @@ def bot_loop():
             try:
                 now_et = get_current_et()
                 now_time = now_et.time()
+                
+                # 檢查並輸出模式切換訊息（只在狀態變化時輸出一次）
+                high_conf_active = now_time >= HIGH_CONFIDENCE_START_TIME
+                stop_buy_active = now_time >= STOP_BUY_TIME
+                start_sell_active = now_time >= START_SELL_TIME
+                force_sell_active = now_time >= FORCE_SELL_TIME
+                
+                if high_conf_active and not last_high_conf_mode:
+                    logger.info("🔔 已進入高信賴度買入模式 (14:45後，買入需 ≥75% 信心)")
+                elif not high_conf_active and last_high_conf_mode and now_time.hour < 14:
+                    logger.info("🔔 已離開高信賴度買入模式")
+                last_high_conf_mode = high_conf_active
+                
+                if stop_buy_active and not last_stop_buy_mode:
+                    logger.info("⛔ 已到達停止買入時間 15:00，禁止新買入")
+                last_stop_buy_mode = stop_buy_active
+                
+                if start_sell_active and not last_start_sell_mode:
+                    logger.info("💰 已到達開始賣出時間 15:00，啟用智能賣出")
+                last_start_sell_mode = start_sell_active
+                
+                if force_sell_active and not last_force_sell_mode:
+                    logger.info("⚠️ 已到達強制平倉時間 15:15，將平倉所有持倉")
+                last_force_sell_mode = force_sell_active
+                
                 market_open = is_us_market_open()
                 if not market_open:
+                    # 非交易時段每 60 秒顯示一次等待訊息
+                    if time.time() - last_waiting_msg_time > 60:
+                        logger.info("⏳ 美股尚未開盤（美東時間 9:30-16:00），機器人等待中...")
+                        last_waiting_msg_time = time.time()
                     for _ in range(CHECK_INTERVAL_SEC):
                         if stop_event.is_set():
                             break
                         time.sleep(1)
                     continue
-
+                else:
+                    # 交易時段重置等待計時器，避免一開盤立刻輸出等待訊息
+                    last_waiting_msg_time = 0
+                    # 如果剛才從非交易時段進入，可輸出開盤訊息
+                    if not hasattr(bot_loop, "_market_open_just_entered"):
+                        logger.info("📈 美股已開盤，機器人開始掃描標的")
+                        bot_loop._market_open_just_entered = True
+                
+                # 強制平倉判斷（已包含在模式切換中，但這裡仍保留原有邏輯）
                 if is_force_sell_time(now_time):
                     logger.info("到達強制平倉時間 15:15，平倉所有持倉")
                     force_close_all(trade_client)
