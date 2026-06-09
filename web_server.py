@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Webull 交易機器人 - 最終穩定版（含前端日誌、錯誤自動停止、模型相容）
+Webull 交易機器人 - 最終穩定版（修復模型載入及前端日誌）
 """
 
 import os
@@ -35,7 +35,6 @@ from webull.trade.trade_client import TradeClient
 from webull.data.data_client import DataClient
 from webull.data.common.category import Category
 from webull.data.common.timespan import Timespan
-from webull.core.exception.exceptions import ServerException
 
 load_dotenv()
 
@@ -126,9 +125,8 @@ def translate_warning(msg: str) -> str:
     return f"⚠️ {msg}"
 
 def add_ui_log(level: str, msg: str):
-    """前端日誌過濾：只排除資產查詢等雜訊，保留所有狀態、交易、錯誤訊息"""
+    # 排除資產查詢等雜訊
     exclude_keywords = ['美元淨資產', '可用現金']
-    
     if any(k in msg for k in exclude_keywords):
         return
     
@@ -229,12 +227,10 @@ def init_webull_clients() -> Tuple[TradeClient, DataClient, str, str]:
         raise ValueError("account_id 不存在")
     logger.info(f"獲取到 account_id: {account_id}")
     
-    # 嘗試獲取用戶名（從帳戶列表中取 account_name 或透過 profile）
+    # 獲取用戶名
     try:
-        # 方法1: 直接從帳戶列表取 account_name
         webull_username = accounts[0].get("account_name", "未知")
         if webull_username == "未知":
-            # 方法2: 嘗試 get_account_profile (如果存在的話)
             try:
                 profile_resp = trade_client.account_v2.get_account_profile(account_id)
                 if profile_resp.status_code == 200:
@@ -299,7 +295,7 @@ def get_real_time_price(data_client: DataClient, symbol: str) -> Optional[float]
     except Exception:
         return None
 
-# ================== 帳戶與持倉 ==================
+# ================== 帳戶與持倉（資產查詢改為 DEBUG） ==================
 def get_account_balance(trade_client: TradeClient) -> Tuple[float, float]:
     try:
         resp = trade_client.account_v2.get_account_list()
@@ -318,6 +314,7 @@ def get_account_balance(trade_client: TradeClient) -> Tuple[float, float]:
                     usd_net = float(asset.get("net_liquidation_value", 0))
                     break
         available = max(usd_cash - RESERVED_FEE_PER_TRADE, 0)
+        # 改為 debug 層級，避免前端顯示
         logger.debug(f"美元淨資產: ${usd_net:,.2f}, 可用現金: ${available:,.2f}")
         return usd_net, available
     except Exception as e:
@@ -513,7 +510,6 @@ def place_sell_order(trade_client: TradeClient, symbol: str, qty: float) -> Tupl
 
 # ================== 技術指標 ==================
 def compute_technical_features(df: pd.DataFrame) -> pd.DataFrame:
-    # 此函數內容與原始相同，省略重複程式碼（實際使用時請保留完整實作）
     df = df.copy()
     df['return_1d'] = df['close'].pct_change(1)
     df['return_5d'] = df['close'].pct_change(5)
@@ -585,18 +581,22 @@ def compute_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     df.drop(columns=['hour', 'atr_adx', 'dx'], errors='ignore', inplace=True)
     return df.dropna().reset_index(drop=True)
 
-# ================== 模型載入（完整相容舊版） ==================
+# ================== 模型載入（完全相容舊版，解決 as_list 錯誤） ==================
 class CompatibleInputLayer(tf.keras.layers.InputLayer):
-    """自訂 InputLayer 以忽略 batch_shape 和 optional 參數"""
-    def __init__(self, **kwargs):
-        kwargs.pop('batch_shape', None)
-        kwargs.pop('optional', None)
-        super().__init__(**kwargs)
+    """處理舊版 Keras 模型中的 batch_shape 參數"""
+    def __init__(self, batch_shape=None, batch_input_shape=None, input_shape=None, **kwargs):
+        # 將 batch_shape 轉為 batch_input_shape
+        if batch_shape is not None:
+            batch_input_shape = batch_shape
+        super().__init__(batch_input_shape=batch_input_shape, input_shape=input_shape, **kwargs)
+        # 確保 _batch_input_shape 為 TensorShape
+        if hasattr(self, '_batch_input_shape') and self._batch_input_shape is None:
+            self._batch_input_shape = tf.TensorShape(batch_input_shape)
 
 class DummyDTypePolicy:
-    """模擬舊版的 DTypePolicy，提供所有可能被調用的屬性和方法"""
-    def __init__(self, name='float32'):
-        self._name = name
+    """模擬舊版 DTypePolicy"""
+    def __init__(self, *args, **kwargs):
+        self._name = "float32"
     @property
     def name(self):
         return self._name
@@ -608,10 +608,17 @@ class DummyDTypePolicy:
         return tf.float32
     def __repr__(self):
         return f'<DummyDTypePolicy name="{self._name}">'
+    @classmethod
+    def from_config(cls, config):
+        return cls()
 
 def load_models() -> Dict[str, Tuple]:
     models_dict = {}
     logger.info("開始載入模型...")
+    custom_objects = {
+        'InputLayer': CompatibleInputLayer,
+        'DTypePolicy': DummyDTypePolicy,
+    }
     for symbol in SYMBOLS:
         xgb_path = f"models/US.{symbol}_xgb.pkl"
         lstm_path = f"models/US.{symbol}_lstm.h5"
@@ -624,25 +631,15 @@ def load_models() -> Dict[str, Tuple]:
         
         lstm_model = None
         try:
-            # 嘗試直接載入
-            lstm_model = tf.keras.models.load_model(lstm_path, compile=False)
-            logger.info(f"直接載入 {symbol} LSTM 成功")
+            lstm_model = tf.keras.models.load_model(
+                lstm_path,
+                compile=False,
+                custom_objects=custom_objects
+            )
+            logger.info(f"成功載入 {symbol} LSTM")
         except Exception as e:
-            logger.warning(f"載入 {symbol} LSTM 遇到錯誤: {e}，嘗試使用自定義物件")
-            try:
-                custom_objects = {
-                    'InputLayer': CompatibleInputLayer,
-                    'DTypePolicy': DummyDTypePolicy,
-                }
-                lstm_model = tf.keras.models.load_model(
-                    lstm_path,
-                    compile=False,
-                    custom_objects=custom_objects
-                )
-                logger.info(f"使用自定義物件載入 {symbol} LSTM 成功")
-            except Exception as e2:
-                logger.error(f"仍無法載入 {symbol} LSTM: {e2}，跳過此股票")
-                continue
+            logger.error(f"無法載入 {symbol} LSTM: {e}，跳過此股票")
+            continue
         
         with open(scaler_path, 'rb') as f:
             scaler = pickle.load(f)
@@ -727,7 +724,7 @@ def force_close_all(trade_client: TradeClient):
         logger.info(f"強制平倉: {symbol} {qty:.4f} 股")
         place_sell_order(trade_client, symbol, qty)
 
-# ================== 機器人主循環（含狀態提示） ==================
+# ================== 機器人主循環 ==================
 def bot_loop():
     global stop_event, trade_client, data_client, models
     logger.info("機器人執行緒啟動，開始交易循環")
@@ -739,7 +736,6 @@ def bot_loop():
     last_start_sell_mode = False
     last_force_sell_mode = False
     
-    # 同步現有持倉
     try:
         pos_df = get_positions(trade_client)
         for _, row in pos_df.iterrows():
@@ -761,7 +757,6 @@ def bot_loop():
                 now_et = get_current_et()
                 now_time = now_et.time()
                 
-                # 模式切換提醒
                 high_conf_active = now_time >= HIGH_CONFIDENCE_START_TIME
                 stop_buy_active = now_time >= STOP_BUY_TIME
                 start_sell_active = now_time >= START_SELL_TIME
