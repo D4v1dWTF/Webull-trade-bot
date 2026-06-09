@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Webull 交易機器人 - 最終穩定版（強制模型重新載入、完整相容舊版 Keras）
+Webull 交易機器人 - 最終版（完美相容舊版 Keras 模型）
 """
 
 import os
@@ -101,7 +101,7 @@ logger.setLevel(logging.INFO)
 logger.addHandler(log_handler)
 logger.addHandler(console)
 
-# 前端日誌列表
+# 前端日誌列表（只顯示交易相關訊息）
 ui_log_messages = []
 
 def add_ui_log(level: str, msg: str):
@@ -173,10 +173,10 @@ def is_sell_allowed(now_time: dt_time) -> bool:
 def is_force_sell_time(now_time: dt_time) -> bool:
     return now_time >= FORCE_SELL_TIME
 
-# ================== Webull 客戶端初始化（確保日誌輸出） ==================
+# ================== Webull 客戶端初始化 ==================
 def init_webull_clients() -> Tuple[TradeClient, DataClient, str, str]:
     global webull_username, account_id
-    logger.info("🔌 正在初始化 Webull 客戶端...")
+    logger.info("正在初始化 Webull 客戶端...")
     app_key = os.getenv("WEBULL_APP_KEY")
     app_secret = os.getenv("WEBULL_APP_SECRET")
     region_id = os.getenv("WEBULL_REGION_ID", "hk")
@@ -199,7 +199,7 @@ def init_webull_clients() -> Tuple[TradeClient, DataClient, str, str]:
     account_id = accounts[0].get("account_id")
     if not account_id:
         raise ValueError("account_id 不存在")
-    logger.info(f"✅ 獲取到 account_id: {account_id}")
+    logger.info(f"獲取到 account_id: {account_id}")
     
     # 獲取用戶名
     try:
@@ -212,14 +212,11 @@ def init_webull_clients() -> Tuple[TradeClient, DataClient, str, str]:
                     webull_username = profile_data.get("account_number", "未知")
             except Exception:
                 pass
-        logger.info(f"✅ Webull 連線成功，帳戶：{webull_username}")
+        logger.info(f"Webull 連線成功，帳戶：{webull_username}")
     except Exception as e:
         webull_username = "未知"
         logger.warning(f"取得帳戶名稱失敗: {e}")
     
-    # 測試獲取餘額確認連線
-    total, available = get_account_balance(trade_client)
-    logger.info(f"💰 帳戶總資產: ${total:.2f}, 可用現金: ${available:.2f}")
     return trade_client, data_client, webull_username, account_id
 
 # ================== 行情數據 ==================
@@ -272,7 +269,7 @@ def get_real_time_price(data_client: DataClient, symbol: str) -> Optional[float]
     except Exception:
         return None
 
-# ================== 帳戶與持倉（資產日誌改為 DEBUG，避免前端顯示） ==================
+# ================== 帳戶與持倉 ==================
 def get_account_balance(trade_client: TradeClient) -> Tuple[float, float]:
     try:
         resp = trade_client.account_v2.get_account_list()
@@ -291,6 +288,7 @@ def get_account_balance(trade_client: TradeClient) -> Tuple[float, float]:
                     usd_net = float(asset.get("net_liquidation_value", 0))
                     break
         available = max(usd_cash - RESERVED_FEE_PER_TRADE, 0)
+        # 使用 debug 層級，避免前端顯示
         logger.debug(f"美元淨資產: ${usd_net:,.2f}, 可用現金: ${available:,.2f}")
         return usd_net, available
     except Exception as e:
@@ -320,7 +318,7 @@ def get_positions(trade_client: TradeClient) -> pd.DataFrame:
         logger.debug(f"獲取持倉時臨時錯誤: {e}")
         return pd.DataFrame()
 
-# ================== 下單函數（保持原樣） ==================
+# ================== 下單函數 ==================
 def place_buy_order(trade_client: TradeClient, symbol: str, amount_usd: float) -> Tuple[bool, str, Optional[str]]:
     if amount_usd < 5.0:
         return False, f"買入金額 ${amount_usd:.2f} < 5 美元", None
@@ -486,7 +484,6 @@ def place_sell_order(trade_client: TradeClient, symbol: str, qty: float) -> Tupl
 
 # ================== 技術指標 ==================
 def compute_technical_features(df: pd.DataFrame) -> pd.DataFrame:
-    # 此函數內容較長，保持與原始相同，省略以節省空間，實際使用時請保留完整實作
     df = df.copy()
     df['return_1d'] = df['close'].pct_change(1)
     df['return_5d'] = df['close'].pct_change(5)
@@ -558,40 +555,52 @@ def compute_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     df.drop(columns=['hour', 'atr_adx', 'dx'], errors='ignore', inplace=True)
     return df.dropna().reset_index(drop=True)
 
-# ================== 模型載入（完整相容舊版，解決 as_list 錯誤） ==================
+# ================== 模型載入（完全相容舊版，解決 optional 參數） ==================
 class CompatibleInputLayer(tf.keras.layers.InputLayer):
-    """處理舊版 Keras 模型中的 batch_shape 和 optional 參數"""
-    def __init__(self, batch_shape=None, batch_input_shape=None, input_shape=None, **kwargs):
-        # 將 batch_shape 轉換為 batch_input_shape
-        if batch_shape is not None and batch_input_shape is None:
-            batch_input_shape = batch_shape
-        super().__init__(batch_input_shape=batch_input_shape, input_shape=input_shape, **kwargs)
-        # 修正 _batch_input_shape 為 TensorShape
-        if batch_input_shape is not None and not isinstance(self._batch_input_shape, tf.TensorShape):
-            self._batch_input_shape = tf.TensorShape(batch_input_shape)
+    """處理舊版 Keras 模型中所有額外的參數"""
+    def __init__(self, **kwargs):
+        # 移除新版 Keras 不接受的參數
+        kwargs.pop('batch_shape', None)
+        kwargs.pop('optional', None)
+        super().__init__(**kwargs)
+    
+    def get_config(self):
+        config = super().get_config()
+        # 清除 config 中可能導致錯誤的鍵
+        config.pop('batch_shape', None)
+        config.pop('optional', None)
+        return config
 
 class DummyDTypePolicy:
-    """模擬舊版 DTypePolicy"""
-    def __init__(self, *args, **kwargs):
-        self._name = "float32"
+    """模擬舊版 DTypePolicy，提供完整序列化支援"""
+    def __init__(self, name='float32'):
+        self._name = name
+    
     @property
     def name(self):
         return self._name
+    
     @property
     def compute_dtype(self):
         return tf.float32
+    
     @property
     def variable_dtype(self):
         return tf.float32
-    def __repr__(self):
-        return f'<DummyDTypePolicy name="{self._name}">'
+    
+    def get_config(self):
+        return {'name': self._name}
+    
     @classmethod
     def from_config(cls, config):
-        return cls()
+        return cls(**config)
+    
+    def __repr__(self):
+        return f'<DummyDTypePolicy name="{self._name}">'
 
 def load_models() -> Dict[str, Tuple]:
     models_dict = {}
-    logger.info("📦 開始載入模型...")
+    logger.info("開始載入模型...")
     custom_objects = {
         'InputLayer': CompatibleInputLayer,
         'DTypePolicy': DummyDTypePolicy,
@@ -613,16 +622,16 @@ def load_models() -> Dict[str, Tuple]:
                 compile=False,
                 custom_objects=custom_objects
             )
-            logger.info(f"✅ 成功載入 {symbol} LSTM")
+            logger.info(f"成功載入 {symbol} LSTM")
         except Exception as e:
-            logger.error(f"❌ 無法載入 {symbol} LSTM: {e}，跳過此股票")
+            logger.error(f"無法載入 {symbol} LSTM: {e}，跳過此股票")
             continue
         
         with open(scaler_path, 'rb') as f:
             scaler = pickle.load(f)
         models_dict[symbol] = (xgb_model, lstm_model, scaler)
-        logger.info(f"🎯 成功載入模型: {symbol}")
-    logger.info(f"🏁 模型載入完成，共 {len(models_dict)} 支股票")
+        logger.info(f"成功載入模型: {symbol}")
+    logger.info(f"模型載入完成，共 {len(models_dict)} 支股票")
     return models_dict
 
 def predict_probability(data_client: DataClient, symbol: str, xgb_model, lstm_model, scaler) -> float:
@@ -704,7 +713,7 @@ def force_close_all(trade_client: TradeClient):
 # ================== 機器人主循環 ==================
 def bot_loop():
     global stop_event, trade_client, data_client, models
-    logger.info("🤖 機器人執行緒啟動，開始交易循環")
+    logger.info("機器人執行緒啟動，開始交易循環")
     tracker = PositionTracker()
     
     last_waiting_msg_time = 0
@@ -713,7 +722,6 @@ def bot_loop():
     last_start_sell_mode = False
     last_force_sell_mode = False
     
-    # 同步現有持倉
     try:
         pos_df = get_positions(trade_client)
         for _, row in pos_df.iterrows():
@@ -789,7 +797,7 @@ def bot_loop():
                         break
                     if symbol not in models:
                         continue
-                    logger.info(f"🔍 分析 {symbol}")
+                    logger.info(f"分析 {symbol}")
                     df = get_market_data(data_client, symbol, 300)
                     if df.empty:
                         continue
@@ -1230,10 +1238,7 @@ def start_bot():
     with thread_lock:
         if bot_thread is not None and bot_thread.is_alive() and not stop_event.is_set():
             return jsonify({"status": "already running"})
-        
-        # 強制重新初始化：如果 trade_client 為 None 或 models 為空，都重新初始化
-        need_init = (trade_client is None) or (len(models) == 0)
-        if need_init:
+        if trade_client is None or len(models) == 0:
             try:
                 trade_client, data_client, webull_username, account_id = init_webull_clients()
                 models = load_models()
@@ -1242,7 +1247,6 @@ def start_bot():
             except Exception as e:
                 logger.exception("初始化失敗")
                 return jsonify({"status": "init failed", "error": str(e)}), 500
-        
         stop_event.clear()
         bot_thread = threading.Thread(target=bot_loop, daemon=True)
         bot_thread.start()
