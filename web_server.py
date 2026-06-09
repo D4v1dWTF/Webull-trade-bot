@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Webull 交易機器人 - 網頁控制版（完全保留原始交易邏輯）
-- 原始交易引擎原封不動
-- 增加 Flask Web 控制介面
-- 支援手機瀏覽器操作（開始/停止/強制平倉）
-- 即時顯示日誌、帳戶餘額、持倉
+Webull 交易機器人 - 最終穩定版（含前端日誌、錯誤自動停止、模型相容）
 """
 
 import os
+os.environ['TF_USE_LEGACY_KERAS'] = '1'
+
 import sys
 import time
 import pickle
@@ -39,10 +37,9 @@ from webull.data.common.category import Category
 from webull.data.common.timespan import Timespan
 from webull.core.exception.exceptions import ServerException
 
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 load_dotenv()
 
-# ================== 以下完全保留原始配置和函數 ==================
+# ================== 全局配置 ==================
 SYMBOLS = [
     'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META',
     'NVDA', 'AMD', 'TSLA', 'PLTR', 'DELL',
@@ -56,14 +53,16 @@ ATR_STOP_MULTIPLIER = 2.0
 ATR_PERIOD = 14
 BUY_AMOUNT_PCT = 0.20
 PROB_THRESHOLD_BUY = 0.65
+HIGH_CONFIDENCE_THRESHOLD = 0.75
 PROB_THRESHOLD_SELL = 0.60
 KLINE_INTERVAL = Timespan.M15.name
 CHECK_INTERVAL_SEC = 5
 SHORT_SUMMARY_INTERVAL_SEC = 10 * 60
 LONG_SUMMARY_INTERVAL_SEC = 30 * 60
-STOP_BUY_TIME = dt_time(15, 30)
-FORCE_SELL_TIME = dt_time(15, 45)
-MODEL_MAX_AGE_DAYS = 7
+HIGH_CONFIDENCE_START_TIME = dt_time(14, 45)
+STOP_BUY_TIME = dt_time(15, 0)
+START_SELL_TIME = dt_time(15, 0)
+FORCE_SELL_TIME = dt_time(15, 15)
 RESERVED_FEE_PER_TRADE = 0.02
 
 FEATURES = [
@@ -88,7 +87,7 @@ FEATURES = [
     'obv', 'obv_ratio', 'mfi'
 ]
 
-# 日誌（原始方式）
+# ================== 日誌設定 ==================
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 log_handler = TimedRotatingFileHandler(
@@ -103,29 +102,81 @@ logger.setLevel(logging.INFO)
 logger.addHandler(log_handler)
 logger.addHandler(console)
 
-# ---------- 新增：前端日誌儲存 ----------
-web_logs = []   # 存放給前端顯示的日誌（最近200條）
+# 前端日誌列表
+ui_log_messages = []
 
-class WebLogHandler(logging.Handler):
-    """自訂日誌處理器，將日誌同時存入列表供前端讀取"""
-    def emit(self, record):
-        try:
-            msg = self.format(record)
-            web_logs.append({
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "level": record.levelname,
-                "msg": msg
-            })
-            while len(web_logs) > 200:
-                web_logs.pop(0)
-        except Exception:
-            pass
+# 警告轉譯字典
+WARNING_TRANSLATION = {
+    'model missing': '模型檔案缺失',
+    'cannot load': '無法載入模型',
+    'token expired': '權杖已過期，請重新授權',
+    'connection failed': '連線失敗，請檢查網路',
+    'market closed': '美股休市中，機器人暫停交易',
+    'insufficient funds': '可用資金不足',
+    'order failed': '下單失敗',
+    'buy amount too small': '買入金額低於5美元',
+    'position limit exceeded': '持倉比例超過限制',
+}
 
-web_handler = WebLogHandler()
-web_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-logger.addHandler(web_handler)
+def translate_warning(msg: str) -> str:
+    msg_lower = msg.lower()
+    for en, zh in WARNING_TRANSLATION.items():
+        if en in msg_lower:
+            return zh
+    return f"⚠️ {msg}"
 
-# ---------- 原始輔助函數 ----------
+def add_ui_log(level: str, msg: str):
+    """前端日誌過濾：只排除資產查詢等雜訊，保留所有狀態、交易、錯誤訊息"""
+    exclude_keywords = ['美元淨資產', '可用現金']
+    
+    if any(k in msg for k in exclude_keywords):
+        return
+    
+    if level == 'WARNING':
+        msg = translate_warning(msg)
+    elif level == 'ERROR':
+        msg = f"❌ 錯誤：{msg}"
+    
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ui_log_messages.append({"time": timestamp, "level": level, "msg": msg})
+    while len(ui_log_messages) > 500:
+        ui_log_messages.pop(0)
+
+# 覆蓋 logger
+original_info = logger.info
+original_error = logger.error
+original_warning = logger.warning
+original_exception = logger.exception
+
+def info_with_ui(msg, *args, **kwargs):
+    original_info(msg, *args, **kwargs)
+    add_ui_log("INFO", msg)
+def error_with_ui(msg, *args, **kwargs):
+    original_error(msg, *args, **kwargs)
+    add_ui_log("ERROR", msg)
+def warning_with_ui(msg, *args, **kwargs):
+    original_warning(msg, *args, **kwargs)
+    add_ui_log("WARNING", msg)
+def exception_with_ui(msg, *args, **kwargs):
+    original_exception(msg, *args, **kwargs)
+    add_ui_log("ERROR", f"嚴重異常：{msg}")
+
+logger.info = info_with_ui
+logger.error = error_with_ui
+logger.warning = warning_with_ui
+logger.exception = exception_with_ui
+
+# ================== 全局狀態 ==================
+stop_event = threading.Event()
+bot_thread = None
+thread_lock = threading.Lock()
+trade_client = None
+data_client = None
+models = {}
+webull_username = "未知"
+account_id = None
+
+# ================== 時間輔助 ==================
 def get_current_et() -> datetime:
     return datetime.now(ZoneInfo("America/New_York"))
 
@@ -137,49 +188,69 @@ def is_us_market_open() -> bool:
     close_t = dt_time(16, 0)
     return open_t <= now_et.time() <= close_t
 
-def is_buy_allowed() -> bool:
-    return get_current_et().time() < STOP_BUY_TIME
+def is_buy_allowed(now_time: dt_time, confidence: float) -> bool:
+    if now_time >= STOP_BUY_TIME:
+        return False
+    if now_time >= HIGH_CONFIDENCE_START_TIME:
+        return confidence >= HIGH_CONFIDENCE_THRESHOLD
+    return confidence >= PROB_THRESHOLD_BUY
 
-def is_force_sell_time() -> bool:
-    return get_current_et().time() >= FORCE_SELL_TIME
+def is_sell_allowed(now_time: dt_time) -> bool:
+    return now_time >= START_SELL_TIME
 
-# ---------- Webull 客戶端（原始）----------
-def init_webull_clients() -> Tuple[ApiClient, TradeClient, DataClient]:
+def is_force_sell_time(now_time: dt_time) -> bool:
+    return now_time >= FORCE_SELL_TIME
+
+# ================== Webull 客戶端初始化（修正用戶名獲取） ==================
+def init_webull_clients() -> Tuple[TradeClient, DataClient, str, str]:
+    global webull_username, account_id
+    logger.info("正在初始化 Webull 客戶端...")
     app_key = os.getenv("WEBULL_APP_KEY")
     app_secret = os.getenv("WEBULL_APP_SECRET")
     region_id = os.getenv("WEBULL_REGION_ID", "hk")
     env = os.getenv("WEBULL_ENVIRONMENT", "prod")
-
     if not app_key or not app_secret:
-        raise ValueError("請在 .env 中配置 WEBULL_APP_KEY 和 WEBULL_APP_SECRET")
-
-    logger.info(f"初始化 Webull 客戶端，環境: {env.upper()}, 區域: {region_id.upper()}")
+        raise ValueError("缺少 WEBULL_APP_KEY 或 WEBULL_APP_SECRET")
     api_client = ApiClient(app_key, app_secret, region_id)
-
     if env.lower() == "prod":
         api_client.add_endpoint(region_id, "api.webull.hk")
-        logger.info("交易接口使用: api.webull.hk")
     else:
         api_client.add_endpoint(region_id, "us-openapi-alb.uat.webullbroker.com")
-        logger.warning("使用沙盒環境")
-
+    trade_client = TradeClient(api_client)
+    data_client = DataClient(api_client)
+    
+    # 獲取 account_id
+    resp = trade_client.account_v2.get_account_list()
+    accounts = resp.json()
+    if not accounts:
+        raise ValueError("無法獲取帳戶列表")
+    account_id = accounts[0].get("account_id")
+    if not account_id:
+        raise ValueError("account_id 不存在")
+    logger.info(f"獲取到 account_id: {account_id}")
+    
+    # 嘗試獲取用戶名（從帳戶列表中取 account_name 或透過 profile）
     try:
-        trade_client = TradeClient(api_client)
-        data_client = DataClient(api_client)
-        logger.info("✅ Webull 客戶端授權成功")
-    except ServerException as e:
-        if "UNAUTHORIZED" in str(e):
-            logger.error("=" * 60)
-            logger.error("❌ 授權失敗，請檢查手機 App 中的 OpenAPI 通知是否已確認。")
-            logger.error("=" * 60)
-            raise
-        else:
-            raise
-    return api_client, trade_client, data_client
+        # 方法1: 直接從帳戶列表取 account_name
+        webull_username = accounts[0].get("account_name", "未知")
+        if webull_username == "未知":
+            # 方法2: 嘗試 get_account_profile (如果存在的話)
+            try:
+                profile_resp = trade_client.account_v2.get_account_profile(account_id)
+                if profile_resp.status_code == 200:
+                    profile_data = profile_resp.json()
+                    webull_username = profile_data.get("account_number", "未知")
+            except Exception:
+                pass
+        logger.info(f"Webull 連線成功，帳戶：{webull_username}")
+    except Exception as e:
+        webull_username = "未知"
+        logger.warning(f"取得帳戶名稱失敗: {e}")
+    
+    return trade_client, data_client, webull_username, account_id
 
-# ---------- 行情、帳戶、下單等原始函數（完全保留）----------
+# ================== 行情數據 ==================
 def get_market_data(data_client: DataClient, symbol: str, count=300) -> pd.DataFrame:
-    # 原始代碼，不變
     try:
         full_symbol = symbol
         res = data_client.market_data.get_history_bar(
@@ -210,10 +281,10 @@ def get_market_data(data_client: DataClient, symbol: str, count=300) -> pd.DataF
                     df[col] = pd.to_numeric(df[col], errors='coerce')
             return df.sort_values('time_key').reset_index(drop=True)
         else:
-            logger.error(f"獲取 {symbol} K線失敗 HTTP {res.status_code}: {res.text[:200]}")
+            logger.warning(f"獲取 {symbol} K線失敗 HTTP {res.status_code}")
             return pd.DataFrame()
     except Exception as e:
-        logger.error(f"獲取 {symbol} K線異常: {e}")
+        logger.warning(f"獲取 {symbol} K線異常: {e}")
         return pd.DataFrame()
 
 def get_real_time_price(data_client: DataClient, symbol: str) -> Optional[float]:
@@ -228,14 +299,15 @@ def get_real_time_price(data_client: DataClient, symbol: str) -> Optional[float]
     except Exception:
         return None
 
+# ================== 帳戶與持倉 ==================
 def get_account_balance(trade_client: TradeClient) -> Tuple[float, float]:
     try:
         resp = trade_client.account_v2.get_account_list()
         accounts = resp.json()
         if not accounts:
             return 0, 0
-        account_id = accounts[0].get("account_id")
-        bal_resp = trade_client.account_v2.get_account_balance(account_id)
+        aid = accounts[0].get("account_id")
+        bal_resp = trade_client.account_v2.get_account_balance(aid)
         bal_data = bal_resp.json()
         usd_cash = 0.0
         usd_net = 0.0
@@ -246,7 +318,7 @@ def get_account_balance(trade_client: TradeClient) -> Tuple[float, float]:
                     usd_net = float(asset.get("net_liquidation_value", 0))
                     break
         available = max(usd_cash - RESERVED_FEE_PER_TRADE, 0)
-        logger.info(f"💰 美元淨資產: ${usd_net:,.2f}, 可用現金: ${available:,.2f}")
+        logger.debug(f"美元淨資產: ${usd_net:,.2f}, 可用現金: ${available:,.2f}")
         return usd_net, available
     except Exception as e:
         logger.error(f"獲取帳戶餘額失敗: {e}")
@@ -258,8 +330,8 @@ def get_positions(trade_client: TradeClient) -> pd.DataFrame:
         accounts = resp.json()
         if not accounts:
             return pd.DataFrame()
-        account_id = accounts[0].get("account_id")
-        pos_resp = trade_client.account_v2.get_account_position(account_id)
+        aid = accounts[0].get("account_id")
+        pos_resp = trade_client.account_v2.get_account_position(aid)
         positions = pos_resp.json()
         if not positions:
             return pd.DataFrame()
@@ -275,8 +347,8 @@ def get_positions(trade_client: TradeClient) -> pd.DataFrame:
         logger.debug(f"獲取持倉時臨時錯誤: {e}")
         return pd.DataFrame()
 
+# ================== 下單函數 ==================
 def place_buy_order(trade_client: TradeClient, symbol: str, amount_usd: float) -> Tuple[bool, str, Optional[str]]:
-    # 原始代碼，不變
     if amount_usd < 5.0:
         return False, f"買入金額 ${amount_usd:.2f} < 5 美元", None
     _, available = get_account_balance(trade_client)
@@ -284,12 +356,6 @@ def place_buy_order(trade_client: TradeClient, symbol: str, amount_usd: float) -
         return False, "可用美元資金不足", None
 
     try:
-        resp = trade_client.account_v2.get_account_list()
-        accounts = resp.json()
-        if not accounts:
-            return False, "無法獲取帳戶 ID", None
-        account_id = accounts[0].get("account_id")
-
         token_file = os.path.join("conf", "token.txt")
         with open(token_file, 'r') as f:
             access_token = f.readline().strip()
@@ -366,17 +432,10 @@ def place_buy_order(trade_client: TradeClient, symbol: str, amount_usd: float) -
         return False, str(e), None
 
 def place_sell_order(trade_client: TradeClient, symbol: str, qty: float) -> Tuple[bool, str, Optional[str]]:
-    # 原始代碼，不變
     if qty <= 0:
         return False, "數量無效", None
 
     try:
-        resp = trade_client.account_v2.get_account_list()
-        accounts = resp.json()
-        if not accounts:
-            return False, "無法獲取帳戶 ID", None
-        account_id = accounts[0].get("account_id")
-
         token_file = os.path.join("conf", "token.txt")
         with open(token_file, 'r') as f:
             access_token = f.readline().strip()
@@ -452,8 +511,9 @@ def place_sell_order(trade_client: TradeClient, symbol: str, qty: float) -> Tupl
         logger.error(f"賣出下單異常: {e}")
         return False, str(e), None
 
+# ================== 技術指標 ==================
 def compute_technical_features(df: pd.DataFrame) -> pd.DataFrame:
-    # 原始代碼，不變
+    # 此函數內容與原始相同，省略重複程式碼（實際使用時請保留完整實作）
     df = df.copy()
     df['return_1d'] = df['close'].pct_change(1)
     df['return_5d'] = df['close'].pct_change(5)
@@ -525,8 +585,33 @@ def compute_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     df.drop(columns=['hour', 'atr_adx', 'dx'], errors='ignore', inplace=True)
     return df.dropna().reset_index(drop=True)
 
+# ================== 模型載入（完整相容舊版） ==================
+class CompatibleInputLayer(tf.keras.layers.InputLayer):
+    """自訂 InputLayer 以忽略 batch_shape 和 optional 參數"""
+    def __init__(self, **kwargs):
+        kwargs.pop('batch_shape', None)
+        kwargs.pop('optional', None)
+        super().__init__(**kwargs)
+
+class DummyDTypePolicy:
+    """模擬舊版的 DTypePolicy，提供所有可能被調用的屬性和方法"""
+    def __init__(self, name='float32'):
+        self._name = name
+    @property
+    def name(self):
+        return self._name
+    @property
+    def compute_dtype(self):
+        return tf.float32
+    @property
+    def variable_dtype(self):
+        return tf.float32
+    def __repr__(self):
+        return f'<DummyDTypePolicy name="{self._name}">'
+
 def load_models() -> Dict[str, Tuple]:
-    models = {}
+    models_dict = {}
+    logger.info("開始載入模型...")
     for symbol in SYMBOLS:
         xgb_path = f"models/US.{symbol}_xgb.pkl"
         lstm_path = f"models/US.{symbol}_lstm.h5"
@@ -536,12 +621,35 @@ def load_models() -> Dict[str, Tuple]:
             continue
         with open(xgb_path, 'rb') as f:
             xgb_model = pickle.load(f)
-        lstm_model = tf.keras.models.load_model(lstm_path, compile=False)
+        
+        lstm_model = None
+        try:
+            # 嘗試直接載入
+            lstm_model = tf.keras.models.load_model(lstm_path, compile=False)
+            logger.info(f"直接載入 {symbol} LSTM 成功")
+        except Exception as e:
+            logger.warning(f"載入 {symbol} LSTM 遇到錯誤: {e}，嘗試使用自定義物件")
+            try:
+                custom_objects = {
+                    'InputLayer': CompatibleInputLayer,
+                    'DTypePolicy': DummyDTypePolicy,
+                }
+                lstm_model = tf.keras.models.load_model(
+                    lstm_path,
+                    compile=False,
+                    custom_objects=custom_objects
+                )
+                logger.info(f"使用自定義物件載入 {symbol} LSTM 成功")
+            except Exception as e2:
+                logger.error(f"仍無法載入 {symbol} LSTM: {e2}，跳過此股票")
+                continue
+        
         with open(scaler_path, 'rb') as f:
             scaler = pickle.load(f)
-        models[symbol] = (xgb_model, lstm_model, scaler)
-        logger.info(f"加載模型: {symbol}")
-    return models
+        models_dict[symbol] = (xgb_model, lstm_model, scaler)
+        logger.info(f"成功載入模型: {symbol}")
+    logger.info(f"模型載入完成，共 {len(models_dict)} 支股票")
+    return models_dict
 
 def predict_probability(data_client: DataClient, symbol: str, xgb_model, lstm_model, scaler) -> float:
     df = get_market_data(data_client, symbol, 300)
@@ -561,12 +669,23 @@ def predict_probability(data_client: DataClient, symbol: str, xgb_model, lstm_mo
         lstm_prob = 0.5
     return 0.6 * xgb_prob + 0.4 * lstm_prob
 
-# 持倉追蹤器（原始）
-position_tracker_global = None   # 在 bot 線程中初始化
+# ================== 持倉追蹤器 ==================
+class PositionTracker:
+    def __init__(self):
+        self.positions = {}
+    def add(self, symbol: str, entry_price: float, entry_atr: float):
+        self.positions[symbol] = {'entry_price': entry_price, 'entry_atr': entry_atr, 'highest_price': entry_price}
+    def remove(self, symbol: str):
+        self.positions.pop(symbol, None)
+    def update_high(self, symbol: str, current_price: float):
+        if symbol in self.positions and current_price > self.positions[symbol]['highest_price']:
+            self.positions[symbol]['highest_price'] = current_price
+    def get_info(self, symbol: str):
+        return self.positions.get(symbol)
 
-def check_exit_conditions(trade_client: TradeClient, data_client: DataClient, symbol: str,
-                          current_price: float, df: pd.DataFrame, sell_prob: float) -> Tuple[bool, str, Optional[float]]:
-    info = position_tracker_global.get_info(symbol) if position_tracker_global else None
+def check_exit_conditions(tracker: PositionTracker, trade_client: TradeClient, data_client: DataClient,
+                          symbol: str, current_price: float, df: pd.DataFrame, sell_prob: float, now_time: dt_time) -> Tuple[bool, str, Optional[float]]:
+    info = tracker.get_info(symbol)
     if info is None:
         return False, "無持倉", None
     entry_price = info['entry_price']
@@ -586,6 +705,8 @@ def check_exit_conditions(trade_client: TradeClient, data_client: DataClient, sy
         stop_price = highest_price - ATR_STOP_MULTIPLIER * entry_atr
         if current_price <= stop_price:
             return True, "ATR移動止損", qty
+    if is_sell_allowed(now_time) and sell_prob >= PROB_THRESHOLD_SELL:
+        return True, f"智能賣出 (預測下跌 {sell_prob*100:.1f}%)", qty
     if sell_prob >= PROB_THRESHOLD_SELL and profit_loss_pct > 0:
         return True, f"ML止盈 (預測下跌 {sell_prob*100:.1f}%)", qty
     if len(df) >= 50:
@@ -595,7 +716,7 @@ def check_exit_conditions(trade_client: TradeClient, data_client: DataClient, sy
         prev_long = df['close'].rolling(26).mean().iloc[-2]
         if prev_short >= prev_long and sma_short < sma_long:
             return True, "死叉賣出", qty
-    position_tracker_global.update_high(symbol, current_price)
+    tracker.update_high(symbol, current_price)
     return False, None, None
 
 def force_close_all(trade_client: TradeClient):
@@ -604,71 +725,23 @@ def force_close_all(trade_client: TradeClient):
         symbol = row['symbol']
         qty = row['qty']
         logger.info(f"強制平倉: {symbol} {qty:.4f} 股")
-        success, msg, oid = place_sell_order(trade_client, symbol, qty)
-        if success and position_tracker_global:
-            position_tracker_global.remove(symbol)
-        else:
-            logger.error(f"平倉失敗 {symbol}: {msg}")
+        place_sell_order(trade_client, symbol, qty)
 
-def print_summary(trade_client: TradeClient, data_client: DataClient, total: float, brief: bool = False):
-    pos_df = get_positions(trade_client)
-    if brief:
-        logger.info(f"📊 簡短摘要 | 總資產: ${total:.2f} | 持倉: {len(pos_df)} 隻")
-    else:
-        logger.info("="*60)
-        logger.info(f"📈 詳細摘要 | 總資產: ${total:.2f} USD")
-        if pos_df.empty:
-            logger.info("無持倉")
-        else:
-            for _, row in pos_df.iterrows():
-                symbol = row['symbol']
-                qty = row['qty']
-                cost = row['cost_price']
-                price = get_real_time_price(data_client, symbol)
-                if price:
-                    pnl = (price - cost) * qty
-                    logger.info(f"  {symbol}: {qty:.4f}股 成本{cost:.2f} 現價{price:.2f} 盈虧{pnl:.2f}")
-                else:
-                    logger.info(f"  {symbol}: {qty:.4f}股 成本{cost:.2f} 價格獲取失敗")
-        logger.info("="*60)
-
-# ================== 以下是新增的 Flask 控制層 ==================
-
-# 全局控制變量
-bot_thread = None
-stop_event = threading.Event()
-flask_app = Flask(__name__)
-
-# 全局客戶端和模型（在 start 時初始化一次）
-trade_client = None
-data_client = None
-models = None
-
-# 自定義持倉追蹤器類（與原始相同）
-class PositionTracker:
-    def __init__(self):
-        self.positions = {}
-    def add(self, symbol: str, entry_price: float, entry_atr: float):
-        self.positions[symbol] = {'entry_price': entry_price, 'entry_atr': entry_atr, 'highest_price': entry_price}
-    def remove(self, symbol: str):
-        self.positions.pop(symbol, None)
-    def update_high(self, symbol: str, current_price: float):
-        if symbol in self.positions and current_price > self.positions[symbol]['highest_price']:
-            self.positions[symbol]['highest_price'] = current_price
-    def get_info(self, symbol: str):
-        return self.positions.get(symbol)
-
-# 核心交易循環（完全複製原始 main 中的 while True 區塊，只修改退出條件）
+# ================== 機器人主循環（含狀態提示） ==================
 def bot_loop():
-    global stop_event, trade_client, data_client, models, position_tracker_global
-    logger.info("🤖 機器人執行緒啟動，開始交易循環")
-    # 初始化持倉追蹤器
+    global stop_event, trade_client, data_client, models
+    logger.info("機器人執行緒啟動，開始交易循環")
     tracker = PositionTracker()
-    position_tracker_global = tracker
-
+    
+    last_waiting_msg_time = 0
+    last_high_conf_mode = False
+    last_stop_buy_mode = False
+    last_start_sell_mode = False
+    last_force_sell_mode = False
+    
     # 同步現有持倉
-    pos_df = get_positions(trade_client)
-    if not pos_df.empty:
+    try:
+        pos_df = get_positions(trade_client)
         for _, row in pos_df.iterrows():
             symbol = row['symbol']
             if symbol in models:
@@ -677,212 +750,149 @@ def bot_loop():
                 atr_val = df['atr'].iloc[-1] if not df.empty and 'atr' in df.columns else 0
                 tracker.add(symbol, cost, atr_val)
                 logger.info(f"同步現有持倉 {symbol} 成本 {cost:.2f}")
-
-    last_short = time.time()
-    last_long = time.time()
+    except Exception as e:
+        logger.exception(f"同步持倉失敗: {e}")
+        stop_event.set()
+        return
 
     try:
         while not stop_event.is_set():
-            now_ts = time.time()
-            market_open = is_us_market_open()
-            if not market_open:
-                time.sleep(CHECK_INTERVAL_SEC)
-                continue
-
-            if is_force_sell_time():
-                logger.info("⏰ 到達強制平倉時間 15:45，平倉所有持倉")
-                force_close_all(trade_client)
-                tracker.positions.clear()
-                time.sleep(60)
-                continue
-
-            total, available = get_account_balance(trade_client)
-
-            if now_ts - last_long >= LONG_SUMMARY_INTERVAL_SEC:
-                print_summary(trade_client, data_client, total, brief=False)
-                last_long, last_short = now_ts, now_ts
-            elif now_ts - last_short >= SHORT_SUMMARY_INTERVAL_SEC:
-                print_summary(trade_client, data_client, total, brief=True)
-                last_short = now_ts
-
-            buy_allowed = is_buy_allowed()
-            if not buy_allowed:
-                logger.info("已過 15:30，禁止新買入")
-
-            pos_df = get_positions(trade_client)
-            current_holdings = {row['symbol']: row['qty'] for _, row in pos_df.iterrows()}
-
-            for symbol in SYMBOLS:
-                if stop_event.is_set():
-                    break
-                if symbol not in models:
+            try:
+                now_et = get_current_et()
+                now_time = now_et.time()
+                
+                # 模式切換提醒
+                high_conf_active = now_time >= HIGH_CONFIDENCE_START_TIME
+                stop_buy_active = now_time >= STOP_BUY_TIME
+                start_sell_active = now_time >= START_SELL_TIME
+                force_sell_active = now_time >= FORCE_SELL_TIME
+                
+                if high_conf_active and not last_high_conf_mode:
+                    logger.info("🔔 已進入高信賴度買入模式 (14:45後，買入需 ≥75% 信心)")
+                elif not high_conf_active and last_high_conf_mode and now_time.hour < 14:
+                    logger.info("🔔 已離開高信賴度買入模式")
+                last_high_conf_mode = high_conf_active
+                
+                if stop_buy_active and not last_stop_buy_mode:
+                    logger.info("⛔ 已到達停止買入時間 15:00，禁止新買入")
+                last_stop_buy_mode = stop_buy_active
+                
+                if start_sell_active and not last_start_sell_mode:
+                    logger.info("💰 已到達開始賣出時間 15:00，啟用智能賣出")
+                last_start_sell_mode = start_sell_active
+                
+                if force_sell_active and not last_force_sell_mode:
+                    logger.info("⚠️ 已到達強制平倉時間 15:15，將平倉所有持倉")
+                last_force_sell_mode = force_sell_active
+                
+                market_open = is_us_market_open()
+                if not market_open:
+                    if time.time() - last_waiting_msg_time > 60:
+                        logger.info("⏳ 美股尚未開盤（美東時間 9:30-16:00），機器人等待中...")
+                        last_waiting_msg_time = time.time()
+                    for _ in range(CHECK_INTERVAL_SEC):
+                        if stop_event.is_set():
+                            break
+                        time.sleep(1)
                     continue
-                logger.info(f"🔍 分析 {symbol}")
-                df = get_market_data(data_client, symbol, 300)
-                if df.empty:
-                    continue
-                current_price = df['close'].iloc[-1]
-                xgb_model, lstm_model, scaler = models[symbol]
-                buy_prob = predict_probability(data_client, symbol, xgb_model, lstm_model, scaler)
-                sell_prob = 1 - buy_prob
-                logger.info(f"  {symbol} 上漲概率: {buy_prob:.3f}")
-
-                holding_qty = current_holdings.get(symbol, 0)
-
-                if holding_qty > 0 and symbol not in tracker.positions:
-                    cost = pos_df[pos_df['symbol'] == symbol]['cost_price'].values[0]
-                    atr_val = df['atr'].iloc[-1] if 'atr' in df.columns else 0
-                    tracker.add(symbol, cost, atr_val)
-                    logger.info(f"初始化持倉信息 {symbol} 成本 {cost:.2f}")
-
-                if holding_qty > 0:
-                    should_sell, reason, qty = check_exit_conditions(
-                        trade_client, data_client, symbol, current_price, df, sell_prob
-                    )
-                    if should_sell:
-                        logger.info(f"賣出 {symbol}: {reason}")
-                        success, msg, oid = place_sell_order(trade_client, symbol, qty)
-                        if success:
-                            tracker.remove(symbol)
-                            time.sleep(0.5)
-                            _, available = get_account_balance(trade_client)
-                        else:
-                            logger.error(f"賣出失敗: {msg}")
-                        continue
-
-                if holding_qty == 0 and buy_allowed and buy_prob >= PROB_THRESHOLD_BUY:
-                    if available <= 0:
-                        logger.info(f"  {symbol} 買入信號，但美元現金為0，無法買入")
-                        continue
-                    buy_amount = available * BUY_AMOUNT_PCT
-                    if buy_amount < 5.0:
-                        logger.info(f"  {symbol} 買入信號，但資金不足（需要至少 $5），跳過")
-                        continue
-                    effective_total = total if total > 0 else available
-                    new_ratio = buy_amount / (effective_total + buy_amount)
-                    if new_ratio > MAX_SINGLE_POSITION_PCT:
-                        logger.info(f"  {symbol} 買入會導致倉位超限 {new_ratio:.1%} > {MAX_SINGLE_POSITION_PCT:.0%}，跳過")
-                        continue
-                    logger.info(f"🎯 買入信號 {symbol} 價格 {current_price:.2f} 概率 {buy_prob:.3f} 金額 ${buy_amount:.2f}")
-                    success, msg, oid = place_buy_order(trade_client, symbol, buy_amount)
-                    if success:
-                        atr_val = df['atr'].iloc[-1] if 'atr' in df.columns else 0
-                        tracker.add(symbol, current_price, atr_val)
-                        available -= buy_amount
-                    else:
-                        logger.error(f"買入失敗: {msg}")
-                time.sleep(0.8)
-
-            logger.info(f"⏳ 等待 {CHECK_INTERVAL_SEC} 秒後繼續...")
-            for _ in range(CHECK_INTERVAL_SEC):
-                if stop_event.is_set():
+                else:
+                    last_waiting_msg_time = 0
+                    if not hasattr(bot_loop, "_market_open_just_entered"):
+                        logger.info("📈 美股已開盤，機器人開始掃描標的")
+                        bot_loop._market_open_just_entered = True
+                
+                if is_force_sell_time(now_time):
+                    logger.info("到達強制平倉時間 15:15，平倉所有持倉")
+                    force_close_all(trade_client)
+                    stop_event.set()
                     break
-                time.sleep(1)
 
+                total, available = get_account_balance(trade_client)
+                pos_df = get_positions(trade_client)
+                current_holdings = {row['symbol']: row['qty'] for _, row in pos_df.iterrows()}
+
+                for symbol in SYMBOLS:
+                    if stop_event.is_set():
+                        break
+                    if symbol not in models:
+                        continue
+                    logger.info(f"分析 {symbol}")
+                    df = get_market_data(data_client, symbol, 300)
+                    if df.empty:
+                        continue
+                    current_price = df['close'].iloc[-1]
+                    xgb_model, lstm_model, scaler = models[symbol]
+                    buy_prob = predict_probability(data_client, symbol, xgb_model, lstm_model, scaler)
+                    sell_prob = 1 - buy_prob
+                    logger.info(f"  {symbol} 上漲概率: {buy_prob:.3f}")
+
+                    holding_qty = current_holdings.get(symbol, 0)
+
+                    if holding_qty > 0:
+                        should_sell, reason, qty = check_exit_conditions(
+                            tracker, trade_client, data_client, symbol, current_price, df, sell_prob, now_time
+                        )
+                        if should_sell:
+                            logger.info(f"賣出 {symbol}: {reason}")
+                            success, msg, oid = place_sell_order(trade_client, symbol, qty)
+                            if success:
+                                tracker.remove(symbol)
+                                time.sleep(0.5)
+                            else:
+                                logger.error(f"賣出失敗: {msg}")
+                            continue
+
+                    if holding_qty == 0:
+                        if is_buy_allowed(now_time, buy_prob):
+                            if available <= 0:
+                                logger.info(f"  {symbol} 買入信號，但美元現金為0")
+                                continue
+                            buy_amount = available * BUY_AMOUNT_PCT
+                            if buy_amount < 5.0:
+                                logger.info(f"  {symbol} 買入信號，但資金不足（需要至少 $5）")
+                                continue
+                            effective_total = total if total > 0 else available
+                            new_ratio = buy_amount / (effective_total + buy_amount)
+                            if new_ratio > MAX_SINGLE_POSITION_PCT:
+                                logger.info(f"  {symbol} 買入會導致倉位超限 {new_ratio:.1%} > {MAX_SINGLE_POSITION_PCT:.0%}")
+                                continue
+                            logger.info(f"🎯 買入信號 {symbol} 價格 {current_price:.2f} 概率 {buy_prob:.3f} 金額 ${buy_amount:.2f}")
+                            success, msg, oid = place_buy_order(trade_client, symbol, buy_amount)
+                            if success:
+                                atr_val = df['atr'].iloc[-1] if 'atr' in df.columns else 0
+                                tracker.add(symbol, current_price, atr_val)
+                                available -= buy_amount
+                            else:
+                                logger.error(f"買入失敗: {msg}")
+                    time.sleep(0.8)
+
+                logger.info("完成一輪掃描，等待5秒")
+                for _ in range(CHECK_INTERVAL_SEC):
+                    if stop_event.is_set():
+                        break
+                    time.sleep(1)
+            except Exception as inner_e:
+                logger.exception(f"交易循環內部發生嚴重錯誤: {inner_e}")
+                logger.error("因嚴重錯誤，機器人將自動停止以避免潛在虧損")
+                stop_event.set()
+                break
     except Exception as e:
-        logger.exception(f"機器人主循環異常: {e}")
+        logger.exception(f"機器人主循環發生嚴重錯誤: {e}")
+        logger.error("因嚴重錯誤，機器人已自動停止")
+        stop_event.set()
     finally:
         logger.info("機器人執行緒已停止")
 
-# ================== Flask 路由 ==================
-@flask_app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
+# ================== Flask Web 服務（內嵌 HTML） ==================
+app = Flask(__name__)
 
-@flask_app.route('/status')
-def status():
-    is_running = bot_thread is not None and bot_thread.is_alive()
-    if trade_client is None:
-        return jsonify({
-            "running": is_running,
-            "total": 0,
-            "available": 0,
-            "positions": [],
-            "username": "未初始化",
-            "logs": web_logs[-50:]
-        })
-    try:
-        total, available = get_account_balance(trade_client)
-        pos_df = get_positions(trade_client)
-        positions = []
-        for _, row in pos_df.iterrows():
-            symbol = row['symbol']
-            qty = row['qty']
-            cost = row['cost_price']
-            price = get_real_time_price(data_client, symbol)
-            pnl = (price - cost) * qty if price else 0
-            positions.append({
-                'symbol': symbol,
-                'qty': qty,
-                'cost': cost,
-                'price': price,
-                'pnl': pnl
-            })
-        # 獲取帳戶名稱（簡單取第一個帳戶的 account_name）
-        username = "未知"
-        try:
-            resp = trade_client.account_v2.get_account_list()
-            accounts = resp.json()
-            if accounts:
-                username = accounts[0].get("account_name", "未知")
-        except:
-            pass
-        return jsonify({
-            "running": is_running,
-            "total": total,
-            "available": available,
-            "positions": positions,
-            "username": username,
-            "logs": web_logs[-50:]
-        })
-    except Exception as e:
-        logger.exception("獲取狀態失敗")
-        return jsonify({"error": str(e)}), 500
-
-@flask_app.route('/start', methods=['POST'])
-def start_bot():
-    global bot_thread, stop_event, trade_client, data_client, models
-    if bot_thread is not None and bot_thread.is_alive():
-        return jsonify({"status": "already running"})
-    # 初始化客戶端和模型（如果尚未初始化）
-    if trade_client is None:
-        try:
-            api_client, trade_client, data_client = init_webull_clients()
-            models = load_models()
-            if not models:
-                raise ValueError("無法載入任何模型，請檢查 models 目錄")
-            logger.info("✅ 初始化完成")
-        except Exception as e:
-            logger.exception("初始化失敗")
-            return jsonify({"status": "init failed", "error": str(e)}), 500
-    stop_event.clear()
-    bot_thread = threading.Thread(target=bot_loop, daemon=True)
-    bot_thread.start()
-    return jsonify({"status": "started"})
-
-@flask_app.route('/stop', methods=['POST'])
-def stop_bot():
-    global stop_event
-    stop_event.set()
-    return jsonify({"status": "stopping"})
-
-@flask_app.route('/force_stop', methods=['POST'])
-def force_stop():
-    global stop_event, trade_client
-    if trade_client is None:
-        return jsonify({"status": "trade client not ready"})
-    force_close_all(trade_client)
-    stop_event.set()
-    return jsonify({"status": "force stopped and liquidated"})
-
-# ================== HTML 模板（遊戲機風格） ==================
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>TradeBoy - Webull 機器人</title>
+    <title>TradeBoy</title>
     <style>
         * { box-sizing: border-box; user-select: none; }
         body {
@@ -1122,7 +1132,7 @@ HTML_TEMPLATE = '''
                 if (positions.length === 0) {
                     document.getElementById('positionsArea').innerHTML = '📋 暫無持倉';
                 } else {
-                    let html = `<table><th>股票</th><th>股數</th><th>成本</th><th>現價</th><th>盈虧</th></tr>`;
+                    let html = `<tr><th>股票</th><th>股數</th><th>成本</th><th>現價</th><th>盈虧</th></tr>`;
                     positions.forEach(p => {
                         let priceStr = p.price ? p.price.toFixed(2) : '--';
                         let pnlStr = p.pnl ? p.pnl.toFixed(2) : '0.00';
@@ -1192,9 +1202,94 @@ HTML_TEMPLATE = '''
 </html>
 '''
 
-# ================== 啟動 Web 服務 ==================
+@app.route('/favicon.ico')
+def favicon():
+    return '', 204
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/status')
+def status():
+    is_running = not stop_event.is_set() and bot_thread is not None and bot_thread.is_alive()
+    if trade_client is None:
+        return jsonify({
+            "running": is_running,
+            "total": 0,
+            "available": 0,
+            "positions": [],
+            "username": webull_username,
+            "logs": ui_log_messages[-50:]
+        })
+    try:
+        total, available = get_account_balance(trade_client)
+        pos_df = get_positions(trade_client)
+        positions = []
+        for _, row in pos_df.iterrows():
+            symbol = row['symbol']
+            qty = row['qty']
+            cost = row['cost_price']
+            price = get_real_time_price(data_client, symbol)
+            pnl = (price - cost) * qty if price else 0
+            positions.append({
+                'symbol': symbol,
+                'qty': qty,
+                'cost': cost,
+                'price': price,
+                'pnl': pnl
+            })
+        return jsonify({
+            "running": is_running,
+            "total": total,
+            "available": available,
+            "positions": positions,
+            "username": webull_username,
+            "logs": ui_log_messages[-50:]
+        })
+    except Exception as e:
+        logger.exception("獲取狀態失敗")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/start', methods=['POST'])
+def start_bot():
+    global bot_thread, stop_event, trade_client, data_client, models, webull_username, account_id
+    with thread_lock:
+        if bot_thread is not None and bot_thread.is_alive() and not stop_event.is_set():
+            return jsonify({"status": "already running"})
+        if trade_client is None:
+            try:
+                trade_client, data_client, webull_username, account_id = init_webull_clients()
+                models = load_models()
+                if not models:
+                    raise ValueError("無法載入任何模型，請檢查 models 目錄")
+            except Exception as e:
+                logger.exception("初始化失敗")
+                return jsonify({"status": "init failed", "error": str(e)}), 500
+        stop_event.clear()
+        bot_thread = threading.Thread(target=bot_loop, daemon=True)
+        bot_thread.start()
+    return jsonify({"status": "started"})
+
+@app.route('/stop', methods=['POST'])
+def stop_bot():
+    global stop_event
+    with thread_lock:
+        stop_event.set()
+    return jsonify({"status": "stopping"})
+
+@app.route('/force_stop', methods=['POST'])
+def force_stop():
+    global trade_client, stop_event
+    if trade_client is None:
+        return jsonify({"status": "trade client not ready"})
+    force_close_all(trade_client)
+    with thread_lock:
+        stop_event.set()
+    return jsonify({"status": "force stopped and liquidated"})
+
 if __name__ == '__main__':
     os.makedirs("conf", exist_ok=True)
     os.makedirs("static", exist_ok=True)
     port = int(os.environ.get('PORT', 5000))
-    flask_app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port)
