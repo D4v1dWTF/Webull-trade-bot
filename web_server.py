@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Webull 交易機器人 - 最終版（完美相容舊版 Keras 模型）
+Webull 交易機器人 - 終極相容版（自動修復舊版 H5 模型）
 """
 
 import os
@@ -19,6 +19,8 @@ import hmac
 import base64
 import threading
 import requests
+import tempfile
+import h5py
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, time as dt_time, timezone
 from zoneinfo import ZoneInfo
@@ -101,7 +103,7 @@ logger.setLevel(logging.INFO)
 logger.addHandler(log_handler)
 logger.addHandler(console)
 
-# 前端日誌列表（只顯示交易相關訊息）
+# 前端日誌列表
 ui_log_messages = []
 
 def add_ui_log(level: str, msg: str):
@@ -288,7 +290,6 @@ def get_account_balance(trade_client: TradeClient) -> Tuple[float, float]:
                     usd_net = float(asset.get("net_liquidation_value", 0))
                     break
         available = max(usd_cash - RESERVED_FEE_PER_TRADE, 0)
-        # 使用 debug 層級，避免前端顯示
         logger.debug(f"美元淨資產: ${usd_net:,.2f}, 可用現金: ${available:,.2f}")
         return usd_net, available
     except Exception as e:
@@ -555,56 +556,40 @@ def compute_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     df.drop(columns=['hour', 'atr_adx', 'dx'], errors='ignore', inplace=True)
     return df.dropna().reset_index(drop=True)
 
-# ================== 模型載入（完全相容舊版，解決 optional 參數） ==================
-class CompatibleInputLayer(tf.keras.layers.InputLayer):
-    """處理舊版 Keras 模型中所有額外的參數"""
-    def __init__(self, **kwargs):
-        # 移除新版 Keras 不接受的參數
-        kwargs.pop('batch_shape', None)
-        kwargs.pop('optional', None)
-        super().__init__(**kwargs)
+# ================== 模型載入（修復 H5 檔案中的舊參數） ==================
+def fix_h5_model(path):
+    """複製並修復 H5 檔案中 InputLayer 的 optional 參數"""
+    # 建立臨時檔案
+    fd, temp_path = tempfile.mkstemp(suffix='.h5')
+    os.close(fd)
     
-    def get_config(self):
-        config = super().get_config()
-        # 清除 config 中可能導致錯誤的鍵
-        config.pop('batch_shape', None)
-        config.pop('optional', None)
-        return config
-
-class DummyDTypePolicy:
-    """模擬舊版 DTypePolicy，提供完整序列化支援"""
-    def __init__(self, name='float32'):
-        self._name = name
+    # 複製原始檔案到臨時檔案
+    with open(path, 'rb') as src, open(temp_path, 'wb') as dst:
+        dst.write(src.read())
     
-    @property
-    def name(self):
-        return self._name
-    
-    @property
-    def compute_dtype(self):
-        return tf.float32
-    
-    @property
-    def variable_dtype(self):
-        return tf.float32
-    
-    def get_config(self):
-        return {'name': self._name}
-    
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-    
-    def __repr__(self):
-        return f'<DummyDTypePolicy name="{self._name}">'
+    # 使用 h5py 修改臨時檔案
+    try:
+        with h5py.File(temp_path, 'r+') as f:
+            # 遞迴查找所有 config 屬性
+            def fix_config(name, obj):
+                if isinstance(obj, h5py.Dataset) and 'config' in name:
+                    config_str = obj[()].decode('utf-8')
+                    # 替換 'optional': True/False 為空
+                    import re
+                    fixed = re.sub(r',?\s*"optional":\s*(true|false)', '', config_str)
+                    if fixed != config_str:
+                        obj[()] = fixed.encode('utf-8')
+                        logger.debug(f"Fixed config in {name}")
+            f.visititems(fix_config)
+        return temp_path
+    except Exception as e:
+        logger.warning(f"修復模型失敗: {e}, 使用原始檔案")
+        os.unlink(temp_path)
+        return path
 
 def load_models() -> Dict[str, Tuple]:
     models_dict = {}
     logger.info("開始載入模型...")
-    custom_objects = {
-        'InputLayer': CompatibleInputLayer,
-        'DTypePolicy': DummyDTypePolicy,
-    }
     for symbol in SYMBOLS:
         xgb_path = f"models/US.{symbol}_xgb.pkl"
         lstm_path = f"models/US.{symbol}_lstm.h5"
@@ -615,17 +600,17 @@ def load_models() -> Dict[str, Tuple]:
         with open(xgb_path, 'rb') as f:
             xgb_model = pickle.load(f)
         
-        lstm_model = None
+        # 修復 LSTM 模型
+        fixed_path = fix_h5_model(lstm_path)
         try:
-            lstm_model = tf.keras.models.load_model(
-                lstm_path,
-                compile=False,
-                custom_objects=custom_objects
-            )
+            lstm_model = tf.keras.models.load_model(fixed_path, compile=False)
             logger.info(f"成功載入 {symbol} LSTM")
         except Exception as e:
             logger.error(f"無法載入 {symbol} LSTM: {e}，跳過此股票")
             continue
+        finally:
+            if fixed_path != lstm_path and os.path.exists(fixed_path):
+                os.unlink(fixed_path)
         
         with open(scaler_path, 'rb') as f:
             scaler = pickle.load(f)
@@ -1113,7 +1098,7 @@ HTML_TEMPLATE = '''
                 if (positions.length === 0) {
                     document.getElementById('positionsArea').innerHTML = '📋 暫無持倉';
                 } else {
-                    let html = `<table><th>股票</th><th>股數</th><th>成本</th><th>現價</th><th>盈虧</th></tr>`;
+                    let html = `<tr><th>股票</th><th>股數</th><th>成本</th><th>現價</th><th>盈虧</th></tr>`;
                     positions.forEach(p => {
                         let priceStr = p.price ? p.price.toFixed(2) : '--';
                         let pnlStr = p.pnl ? p.pnl.toFixed(2) : '0.00';
