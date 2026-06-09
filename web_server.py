@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Webull 交易機器人 - 完整版（繁體中文，含日誌過濾、線程安全停止）
+Webull 交易機器人 - 完整版（內嵌 HTML、免責聲明、日誌過濾、錯誤自動停止）
 """
 
-# 強制使用舊版 Keras 相容模式（解決 DTypePolicy 錯誤）
+# 強制使用舊版 Keras 相容模式
 import os
 os.environ['TF_USE_LEGACY_KERAS'] = '1'
 
@@ -20,6 +20,7 @@ import hmac
 import base64
 import threading
 import requests
+import traceback
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, time as dt_time, timezone
 from zoneinfo import ZoneInfo
@@ -28,7 +29,7 @@ from typing import Dict, Tuple, Optional
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from flask import Flask, render_template, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, render_template_string
 from dotenv import load_dotenv
 
 from webull.core.client import ApiClient
@@ -87,7 +88,7 @@ FEATURES = [
     'obv', 'obv_ratio', 'mfi'
 ]
 
-# ================== 日誌（分離前端與檔案） ==================
+# ================== 日誌設定 ==================
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 log_handler = TimedRotatingFileHandler(
@@ -102,42 +103,65 @@ logger.setLevel(logging.INFO)
 logger.addHandler(log_handler)
 logger.addHandler(console)
 
-# 前端日誌列表（只存放交易相關訊息）
+# 前端日誌列表
 ui_log_messages = []
 
+# 警告轉譯字典
+WARNING_TRANSLATION = {
+    'model missing': '模型檔案缺失',
+    'cannot load': '無法載入模型',
+    'token expired': '權杖已過期，請重新授權',
+    'connection failed': '連線失敗，請檢查網路',
+    'market closed': '美股休市中，機器人暫停交易',
+    'insufficient funds': '可用資金不足',
+    'order failed': '下單失敗',
+    'buy amount too small': '買入金額低於5美元',
+    'position limit exceeded': '持倉比例超過限制',
+}
+
+def translate_warning(msg: str) -> str:
+    msg_lower = msg.lower()
+    for en, zh in WARNING_TRANSLATION.items():
+        if en in msg_lower:
+            return zh
+    return f"⚠️ {msg}"
+
 def add_ui_log(level: str, msg: str):
-    """只加入與交易決策相關的日誌（股票分析、買賣訊號）"""
-    # 定義要顯示的關鍵字（只要包含任一關鍵字就顯示）
+    exclude_keywords = [
+        '美元淨資產', '可用現金', '載入模型', '版本兼容',
+        '初始化失敗', '跳過此股票', '無法載入任何模型'
+    ]
     keywords = [
         '分析', '上漲概率', '買入信號', '賣出', '止損', '止盈', '平倉',
         '死叉賣出', 'ATR移動止損', '硬止損', '智能賣出', 'ML止盈',
-        '成功', '訂單'
+        '成功', '訂單', '強制平倉', '機器人已停止', '機器人啟動',
+        '強制平倉時間', '到達強制平倉時間', '交易時段'
     ]
-    # 排除的關鍵字（資產查詢等）
-    exclude_keywords = ['美元淨資產', '可用現金', '載入模型', '版本兼容', '錯誤', '警告', '初始化']
     
     if any(k in msg for k in exclude_keywords):
         return
-    if level == 'INFO' and any(k in msg for k in keywords):
+    
+    if level == 'WARNING':
+        msg = translate_warning(msg)
+    elif level == 'ERROR':
+        msg = f"❌ 錯誤：{msg}"
+    
+    if level in ('WARNING', 'ERROR'):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ui_log_messages.append({"time": timestamp, "level": level, "msg": msg})
         while len(ui_log_messages) > 500:
             ui_log_messages.pop(0)
-    elif level in ('ERROR', 'WARNING') and '訂單' not in msg:
-        # 不顯示錯誤警告在前端（但可顯示訂單失敗）
-        pass
-    else:
-        # 其他 INFO 如訂單成功也顯示
-        if '訂單' in msg or '強制平倉' in msg:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            ui_log_messages.append({"time": timestamp, "level": level, "msg": msg})
-            while len(ui_log_messages) > 500:
-                ui_log_messages.pop(0)
+    elif level == 'INFO' and any(k in msg for k in keywords):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ui_log_messages.append({"time": timestamp, "level": level, "msg": msg})
+        while len(ui_log_messages) > 500:
+            ui_log_messages.pop(0)
 
-# 覆蓋 logger 方法，同時寫入檔案/主控台，並選擇性加入前端
+# 覆蓋 logger
 original_info = logger.info
 original_error = logger.error
 original_warning = logger.warning
+original_exception = logger.exception
 
 def info_with_ui(msg, *args, **kwargs):
     original_info(msg, *args, **kwargs)
@@ -148,10 +172,14 @@ def error_with_ui(msg, *args, **kwargs):
 def warning_with_ui(msg, *args, **kwargs):
     original_warning(msg, *args, **kwargs)
     add_ui_log("WARNING", msg)
+def exception_with_ui(msg, *args, **kwargs):
+    original_exception(msg, *args, **kwargs)
+    add_ui_log("ERROR", f"嚴重異常：{msg}")
 
 logger.info = info_with_ui
 logger.error = error_with_ui
 logger.warning = warning_with_ui
+logger.exception = exception_with_ui
 
 # ================== 全局狀態 ==================
 stop_event = threading.Event()
@@ -163,7 +191,7 @@ models = {}
 webull_username = "未知"
 account_id = None
 
-# ================== 輔助函數（時間） ==================
+# ================== 時間輔助 ==================
 def get_current_et() -> datetime:
     return datetime.now(ZoneInfo("America/New_York"))
 
@@ -205,7 +233,6 @@ def init_webull_clients() -> Tuple[TradeClient, DataClient, str, str]:
     trade_client = TradeClient(api_client)
     data_client = DataClient(api_client)
     
-    # 獲取 account_id
     resp = trade_client.account_v2.get_account_list()
     accounts = resp.json()
     if not accounts:
@@ -214,7 +241,6 @@ def init_webull_clients() -> Tuple[TradeClient, DataClient, str, str]:
     if not account_id:
         raise ValueError("account_id 不存在")
     
-    # 獲取帳號名稱
     try:
         profile_resp = trade_client.account_v2.get_account_profile(account_id)
         if profile_resp.status_code == 200:
@@ -227,7 +253,7 @@ def init_webull_clients() -> Tuple[TradeClient, DataClient, str, str]:
     
     return trade_client, data_client, webull_username, account_id
 
-# ================== 行情數據獲取 ==================
+# ================== 行情數據 ==================
 def get_market_data(data_client: DataClient, symbol: str, count=300) -> pd.DataFrame:
     try:
         full_symbol = symbol
@@ -277,7 +303,7 @@ def get_real_time_price(data_client: DataClient, symbol: str) -> Optional[float]
     except Exception:
         return None
 
-# ================== 帳戶與持倉（修改日誌層級避免前端雜訊） ==================
+# ================== 帳戶與持倉 ==================
 def get_account_balance(trade_client: TradeClient) -> Tuple[float, float]:
     try:
         resp = trade_client.account_v2.get_account_list()
@@ -296,7 +322,6 @@ def get_account_balance(trade_client: TradeClient) -> Tuple[float, float]:
                     usd_net = float(asset.get("net_liquidation_value", 0))
                     break
         available = max(usd_cash - RESERVED_FEE_PER_TRADE, 0)
-        # 改為 debug 層級，避免前端顯示
         logger.debug(f"美元淨資產: ${usd_net:,.2f}, 可用現金: ${available:,.2f}")
         return usd_net, available
     except Exception as e:
@@ -326,7 +351,7 @@ def get_positions(trade_client: TradeClient) -> pd.DataFrame:
         logger.debug(f"獲取持倉時臨時錯誤: {e}")
         return pd.DataFrame()
 
-# ================== 下單 ==================
+# ================== 下單函數 ==================
 def place_buy_order(trade_client: TradeClient, symbol: str, amount_usd: float) -> Tuple[bool, str, Optional[str]]:
     if amount_usd < 5.0:
         return False, f"買入金額 ${amount_usd:.2f} < 5 美元", None
@@ -563,7 +588,17 @@ def compute_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     df.drop(columns=['hour', 'atr_adx', 'dx'], errors='ignore', inplace=True)
     return df.dropna().reset_index(drop=True)
 
-# ================== 模型載入（使用舊版相容模式） ==================
+# ================== 模型載入（相容舊版） ==================
+class CompatibleInputLayer(tf.keras.layers.InputLayer):
+    def __init__(self, **kwargs):
+        kwargs.pop('batch_shape', None)
+        kwargs.pop('optional', None)
+        super().__init__(**kwargs)
+
+class DummyDTypePolicy:
+    def __init__(self, *args, **kwargs):
+        pass
+
 def load_models() -> Dict[str, Tuple]:
     models_dict = {}
     for symbol in SYMBOLS:
@@ -575,11 +610,26 @@ def load_models() -> Dict[str, Tuple]:
             continue
         with open(xgb_path, 'rb') as f:
             xgb_model = pickle.load(f)
+        
+        lstm_model = None
         try:
             lstm_model = tf.keras.models.load_model(lstm_path, compile=False)
         except Exception as e:
-            logger.error(f"載入 {symbol} LSTM 失敗: {e}，跳過此股票")
-            continue
+            logger.warning(f"載入 {symbol} LSTM 遇到錯誤，嘗試使用自定義物件")
+            try:
+                custom_objects = {
+                    'InputLayer': CompatibleInputLayer,
+                    'DTypePolicy': DummyDTypePolicy,
+                }
+                lstm_model = tf.keras.models.load_model(
+                    lstm_path,
+                    compile=False,
+                    custom_objects=custom_objects
+                )
+            except Exception as e2:
+                logger.error(f"仍無法載入 {symbol} LSTM: {e2}，跳過此股票")
+                continue
+        
         with open(scaler_path, 'rb') as f:
             scaler = pickle.load(f)
         models_dict[symbol] = (xgb_model, lstm_model, scaler)
@@ -662,122 +712,451 @@ def force_close_all(trade_client: TradeClient):
         logger.info(f"強制平倉: {symbol} {qty:.4f} 股")
         place_sell_order(trade_client, symbol, qty)
 
-# ================== 機器人主循環 ==================
+# ================== 機器人主循環（含嚴重錯誤自動停止） ==================
 def bot_loop():
     global stop_event, trade_client, data_client, models
     logger.info("機器人執行緒啟動，開始交易循環")
     tracker = PositionTracker()
+    
     # 同步現有持倉
-    pos_df = get_positions(trade_client)
-    for _, row in pos_df.iterrows():
-        symbol = row['symbol']
-        if symbol in models:
-            cost = row['cost_price']
-            df = get_market_data(data_client, symbol, 200)
-            atr_val = df['atr'].iloc[-1] if not df.empty and 'atr' in df.columns else 0
-            tracker.add(symbol, cost, atr_val)
-            logger.info(f"同步現有持倉 {symbol} 成本 {cost:.2f}")
+    try:
+        pos_df = get_positions(trade_client)
+        for _, row in pos_df.iterrows():
+            symbol = row['symbol']
+            if symbol in models:
+                cost = row['cost_price']
+                df = get_market_data(data_client, symbol, 200)
+                atr_val = df['atr'].iloc[-1] if not df.empty and 'atr' in df.columns else 0
+                tracker.add(symbol, cost, atr_val)
+                logger.info(f"同步現有持倉 {symbol} 成本 {cost:.2f}")
+    except Exception as e:
+        logger.exception(f"同步持倉失敗: {e}")
+        stop_event.set()
+        return
 
     try:
         while not stop_event.is_set():
-            now_et = get_current_et()
-            now_time = now_et.time()
-            market_open = is_us_market_open()
-            if not market_open:
+            try:
+                now_et = get_current_et()
+                now_time = now_et.time()
+                market_open = is_us_market_open()
+                if not market_open:
+                    for _ in range(CHECK_INTERVAL_SEC):
+                        if stop_event.is_set():
+                            break
+                        time.sleep(1)
+                    continue
+
+                if is_force_sell_time(now_time):
+                    logger.info("到達強制平倉時間 15:15，平倉所有持倉")
+                    force_close_all(trade_client)
+                    stop_event.set()
+                    break
+
+                total, available = get_account_balance(trade_client)
+                pos_df = get_positions(trade_client)
+                current_holdings = {row['symbol']: row['qty'] for _, row in pos_df.iterrows()}
+
+                for symbol in SYMBOLS:
+                    if stop_event.is_set():
+                        break
+                    if symbol not in models:
+                        continue
+                    logger.info(f"分析 {symbol}")
+                    df = get_market_data(data_client, symbol, 300)
+                    if df.empty:
+                        continue
+                    current_price = df['close'].iloc[-1]
+                    xgb_model, lstm_model, scaler = models[symbol]
+                    buy_prob = predict_probability(data_client, symbol, xgb_model, lstm_model, scaler)
+                    sell_prob = 1 - buy_prob
+                    logger.info(f"  {symbol} 上漲概率: {buy_prob:.3f}")
+
+                    holding_qty = current_holdings.get(symbol, 0)
+
+                    # 賣出邏輯
+                    if holding_qty > 0:
+                        should_sell, reason, qty = check_exit_conditions(
+                            tracker, trade_client, data_client, symbol, current_price, df, sell_prob, now_time
+                        )
+                        if should_sell:
+                            logger.info(f"賣出 {symbol}: {reason}")
+                            success, msg, oid = place_sell_order(trade_client, symbol, qty)
+                            if success:
+                                tracker.remove(symbol)
+                                time.sleep(0.5)
+                            else:
+                                logger.error(f"賣出失敗: {msg}")
+                            continue
+
+                    # 買入邏輯
+                    if holding_qty == 0:
+                        if is_buy_allowed(now_time, buy_prob):
+                            if available <= 0:
+                                logger.info(f"  {symbol} 買入信號，但美元現金為0")
+                                continue
+                            buy_amount = available * BUY_AMOUNT_PCT
+                            if buy_amount < 5.0:
+                                logger.info(f"  {symbol} 買入信號，但資金不足（需要至少 $5）")
+                                continue
+                            effective_total = total if total > 0 else available
+                            new_ratio = buy_amount / (effective_total + buy_amount)
+                            if new_ratio > MAX_SINGLE_POSITION_PCT:
+                                logger.info(f"  {symbol} 買入會導致倉位超限 {new_ratio:.1%} > {MAX_SINGLE_POSITION_PCT:.0%}")
+                                continue
+                            logger.info(f"🎯 買入信號 {symbol} 價格 {current_price:.2f} 概率 {buy_prob:.3f} 金額 ${buy_amount:.2f}")
+                            success, msg, oid = place_buy_order(trade_client, symbol, buy_amount)
+                            if success:
+                                atr_val = df['atr'].iloc[-1] if 'atr' in df.columns else 0
+                                tracker.add(symbol, current_price, atr_val)
+                                available -= buy_amount
+                            else:
+                                logger.error(f"買入失敗: {msg}")
+                    time.sleep(0.8)
+
+                logger.info("完成一輪掃描，等待5秒")
                 for _ in range(CHECK_INTERVAL_SEC):
                     if stop_event.is_set():
                         break
                     time.sleep(1)
-                continue
-
-            if is_force_sell_time(now_time):
-                logger.info("到達強制平倉時間 15:15，平倉所有持倉")
-                force_close_all(trade_client)
+            except Exception as inner_e:
+                logger.exception(f"交易循環內部發生嚴重錯誤: {inner_e}")
+                logger.error("因嚴重錯誤，機器人將自動停止以避免潛在虧損")
                 stop_event.set()
                 break
-
-            total, available = get_account_balance(trade_client)
-            pos_df = get_positions(trade_client)
-            current_holdings = {row['symbol']: row['qty'] for _, row in pos_df.iterrows()}
-
-            for symbol in SYMBOLS:
-                if stop_event.is_set():
-                    break
-                if symbol not in models:
-                    continue
-                logger.info(f"分析 {symbol}")
-                df = get_market_data(data_client, symbol, 300)
-                if df.empty:
-                    continue
-                current_price = df['close'].iloc[-1]
-                xgb_model, lstm_model, scaler = models[symbol]
-                buy_prob = predict_probability(data_client, symbol, xgb_model, lstm_model, scaler)
-                sell_prob = 1 - buy_prob
-                logger.info(f"  {symbol} 上漲概率: {buy_prob:.3f}")
-
-                holding_qty = current_holdings.get(symbol, 0)
-
-                # 賣出邏輯
-                if holding_qty > 0:
-                    should_sell, reason, qty = check_exit_conditions(
-                        tracker, trade_client, data_client, symbol, current_price, df, sell_prob, now_time
-                    )
-                    if should_sell:
-                        logger.info(f"賣出 {symbol}: {reason}")
-                        success, msg, oid = place_sell_order(trade_client, symbol, qty)
-                        if success:
-                            tracker.remove(symbol)
-                            time.sleep(0.5)
-                        else:
-                            logger.error(f"賣出失敗: {msg}")
-                        continue
-
-                # 買入邏輯
-                if holding_qty == 0:
-                    if is_buy_allowed(now_time, buy_prob):
-                        if available <= 0:
-                            logger.info(f"  {symbol} 買入信號，但美元現金為0")
-                            continue
-                        buy_amount = available * BUY_AMOUNT_PCT
-                        if buy_amount < 5.0:
-                            logger.info(f"  {symbol} 買入信號，但資金不足（需要至少 $5）")
-                            continue
-                        effective_total = total if total > 0 else available
-                        new_ratio = buy_amount / (effective_total + buy_amount)
-                        if new_ratio > MAX_SINGLE_POSITION_PCT:
-                            logger.info(f"  {symbol} 買入會導致倉位超限 {new_ratio:.1%} > {MAX_SINGLE_POSITION_PCT:.0%}")
-                            continue
-                        logger.info(f"🎯 買入信號 {symbol} 價格 {current_price:.2f} 概率 {buy_prob:.3f} 金額 ${buy_amount:.2f}")
-                        success, msg, oid = place_buy_order(trade_client, symbol, buy_amount)
-                        if success:
-                            atr_val = df['atr'].iloc[-1] if 'atr' in df.columns else 0
-                            tracker.add(symbol, current_price, atr_val)
-                            available -= buy_amount
-                        else:
-                            logger.error(f"買入失敗: {msg}")
-                time.sleep(0.8)
-
-            logger.info("完成一輪掃描，等待5秒")
-            for _ in range(CHECK_INTERVAL_SEC):
-                if stop_event.is_set():
-                    break
-                time.sleep(1)
     except Exception as e:
-        logger.exception(f"機器人循環異常: {e}")
+        logger.exception(f"機器人主循環發生嚴重錯誤: {e}")
+        logger.error("因嚴重錯誤，機器人已自動停止")
+        stop_event.set()
     finally:
         logger.info("機器人執行緒已停止")
 
-# ================== Flask Web 服務 ==================
+# ================== Flask Web 服務（內嵌 HTML） ==================
 app = Flask(__name__)
+
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>TradeBoy</title>
+    <style>
+        * { box-sizing: border-box; user-select: none; }
+        body {
+            background: #8b8b8b;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            font-family: 'Courier New', 'VT323', monospace;
+            margin: 0;
+            padding: 20px;
+        }
+        .gameboy {
+            background: #b5b5b5;
+            border-radius: 20px;
+            box-shadow: 0 10px 0 #5a5a5a;
+            padding: 20px 20px 30px;
+            max-width: 620px;
+            width: 100%;
+        }
+        .screen {
+            background: #9bbc0f;
+            border: 5px solid #306230;
+            border-radius: 12px;
+            padding: 10px;
+            margin-bottom: 15px;
+            font-family: monospace;
+            color: #0f380f;
+            font-weight: bold;
+            font-size: 13px;
+            box-shadow: inset 0 0 5px #306230;
+        }
+        .balance {
+            background: #0f380f;
+            color: #9bbc0f;
+            padding: 8px;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            text-align: center;
+            font-size: 15px;
+        }
+        .positions {
+            background: #e0f0d0;
+            padding: 8px;
+            border-radius: 8px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-size: 12px;
+            margin-bottom: 10px;
+        }
+        .positions table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .positions th, .positions td {
+            text-align: left;
+            padding: 4px 2px;
+            border-bottom: 1px solid #7c8c5e;
+        }
+        .log-area {
+            background: #0f380f;
+            color: #9bbc0f;
+            padding: 6px;
+            border-radius: 8px;
+            height: 150px;
+            overflow-y: auto;
+            font-size: 11px;
+            font-family: monospace;
+            margin-bottom: 15px;
+            text-align: left;
+        }
+        .log-area p {
+            margin: 2px 0;
+            border-bottom: 1px dotted #306230;
+        }
+        .controls {
+            display: flex;
+            justify-content: space-around;
+            gap: 15px;
+            margin-top: 5px;
+        }
+        button {
+            background: #4b4b4b;
+            border: none;
+            color: white;
+            font-family: inherit;
+            font-size: 18px;
+            font-weight: bold;
+            padding: 12px 16px;
+            border-radius: 50px;
+            box-shadow: 0 5px 0 #2a2a2a;
+            cursor: pointer;
+            transition: 0.05s linear;
+            flex: 1;
+            letter-spacing: 2px;
+        }
+        button:active {
+            transform: translateY(2px);
+            box-shadow: 0 2px 0 #2a2a2a;
+        }
+        button.start { background: #3a7a3a; box-shadow: 0 5px 0 #1e4a1e; }
+        button.stop { background: #aa4a4a; box-shadow: 0 5px 0 #6a2a2a; }
+        button.force { background: #aa6a2a; box-shadow: 0 5px 0 #6a3a0a; }
+        .status {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #333;
+            margin-right: 6px;
+        }
+        .status.running { background: #2ecc2e; box-shadow: 0 0 5px #2ecc2e; }
+        .status.stopped { background: #e74c3c; }
+        .refresh-note {
+            text-align: center;
+            font-size: 10px;
+            margin-top: 10px;
+            color: #306230;
+        }
+        .disclaimer {
+            font-size: 10px;
+            text-align: center;
+            margin-top: 15px;
+            color: #306230;
+            border-top: 1px solid #306230;
+            padding-top: 8px;
+        }
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.6);
+            align-items: center;
+            justify-content: center;
+        }
+        .modal-content {
+            background-color: #b5b5b5;
+            border-radius: 20px;
+            padding: 20px;
+            text-align: center;
+            max-width: 280px;
+            font-family: monospace;
+            border: 3px solid #306230;
+        }
+        .modal-buttons {
+            display: flex;
+            justify-content: space-around;
+            margin-top: 20px;
+        }
+        .modal-buttons button {
+            font-size: 16px;
+            padding: 8px 12px;
+            width: 80px;
+        }
+    </style>
+</head>
+<body>
+<div class="gameboy">
+    <div class="screen">
+        <div class="balance" id="balanceArea">💰 載入中...</div>
+        <div class="positions" id="positionsArea">📋 持倉列表</div>
+        <div class="log-area" id="logArea">📜 日誌區域</div>
+    </div>
+    <div class="controls">
+        <button class="start" id="btnStart">▶ 開始</button>
+        <button class="stop" id="btnStop">⏹ 停止</button>
+        <button class="force" id="btnForce">⛔ 平倉並停止</button>
+    </div>
+    <div class="refresh-note">
+        <span id="statusLed" class="status stopped"></span> 機器人狀態：<span id="runStatus">已停止</span>
+    </div>
+    <div class="disclaimer">
+        ⚠️ 免責聲明：本機器人為輔助交易工具，不保證獲利。任何因使用本程式造成的投資損失，開發者與 AI 協助者概不負責。請謹慎使用，風險自負。
+    </div>
+</div>
+
+<div id="confirmModal" class="modal">
+    <div class="modal-content">
+        <p id="modalMessage">確定要執行此操作嗎？</p>
+        <div class="modal-buttons">
+            <button id="modalConfirm">確認</button>
+            <button id="modalCancel">取消</button>
+        </div>
+    </div>
+</div>
+
+<script>
+    let pendingAction = null;
+
+    function showModal(message, onConfirm) {
+        const modal = document.getElementById('confirmModal');
+        const msgSpan = document.getElementById('modalMessage');
+        msgSpan.innerText = message;
+        modal.style.display = 'flex';
+        const confirmBtn = document.getElementById('modalConfirm');
+        const cancelBtn = document.getElementById('modalCancel');
+        const handler = () => {
+            modal.style.display = 'none';
+            confirmBtn.removeEventListener('click', handler);
+            cancelBtn.removeEventListener('click', cancelHandler);
+            onConfirm();
+        };
+        const cancelHandler = () => {
+            modal.style.display = 'none';
+            confirmBtn.removeEventListener('click', handler);
+            cancelBtn.removeEventListener('click', cancelHandler);
+        };
+        confirmBtn.addEventListener('click', handler);
+        cancelBtn.addEventListener('click', cancelHandler);
+    }
+
+    function fetchStatus() {
+        fetch('/status')
+            .then(res => res.json())
+            .then(data => {
+                const isRunning = data.running;
+                const led = document.getElementById('statusLed');
+                const statusText = document.getElementById('runStatus');
+                if (isRunning) {
+                    led.className = 'status running';
+                    statusText.innerText = '運行中';
+                } else {
+                    led.className = 'status stopped';
+                    statusText.innerText = '已停止';
+                }
+                const username = data.username || '未知';
+                const total = data.total || 0;
+                const available = data.available || 0;
+                document.getElementById('balanceArea').innerHTML = `
+                    👤 ${username} &nbsp;| 💰 淨資產: $${total.toFixed(2)} &nbsp;| 可用: $${available.toFixed(2)}
+                `;
+                const positions = data.positions || [];
+                if (positions.length === 0) {
+                    document.getElementById('positionsArea').innerHTML = '📋 暫無持倉';
+                } else {
+                    let html = `<table><tr><th>股票</th><th>股數</th><th>成本</th><th>現價</th><th>盈虧</th></tr>`;
+                    positions.forEach(p => {
+                        let priceStr = p.price ? p.price.toFixed(2) : '--';
+                        let pnlStr = p.pnl ? p.pnl.toFixed(2) : '0.00';
+                        let pnlColor = p.pnl >= 0 ? '#2a6b2a' : '#aa4a4a';
+                        html += `<tr>
+                            <td>${p.symbol}</td>
+                            <td>${p.qty.toFixed(4)}</td>
+                            <td>${p.cost.toFixed(2)}</td>
+                            <td>${priceStr}</td>
+                            <td style="color:${pnlColor}">$${pnlStr}</td>
+                        </tr>`;
+                    });
+                    html += `</table>`;
+                    document.getElementById('positionsArea').innerHTML = html;
+                }
+                const logs = data.logs || [];
+                const logDiv = document.getElementById('logArea');
+                if (logs.length === 0) {
+                    logDiv.innerHTML = '📜 尚無日誌';
+                } else {
+                    let logHtml = '';
+                    logs.slice().reverse().forEach(log => {
+                        logHtml += `<p>[${log.time}] ${log.level}: ${log.msg}</p>`;
+                    });
+                    logDiv.innerHTML = logHtml;
+                }
+            })
+            .catch(err => console.error('獲取狀態失敗', err));
+    }
+
+    function sendCommand(endpoint, confirmMsg) {
+        if (confirmMsg) {
+            showModal(confirmMsg, () => {
+                fetch(endpoint, { method: 'POST' })
+                    .then(res => res.json())
+                    .then(data => {
+                        console.log(data);
+                        fetchStatus();
+                    })
+                    .catch(err => alert('命令發送失敗: ' + err));
+            });
+        } else {
+            fetch(endpoint, { method: 'POST' })
+                .then(res => res.json())
+                .then(data => {
+                    console.log(data);
+                    fetchStatus();
+                })
+                .catch(err => alert('命令發送失敗: ' + err));
+        }
+    }
+
+    document.getElementById('btnStart').addEventListener('click', () => {
+        sendCommand('/start', '確定要啟動機器人嗎？');
+    });
+    document.getElementById('btnStop').addEventListener('click', () => {
+        sendCommand('/stop', '確定要停止機器人嗎？停止不會賣出任何股票，機器人將暫停交易。');
+    });
+    document.getElementById('btnForce').addEventListener('click', () => {
+        sendCommand('/force_stop', '⚠️ 確定要強制平倉所有持倉並停止機器人？此操作不可逆！');
+    });
+
+    fetchStatus();
+    setInterval(fetchStatus, 3000);
+</script>
+</body>
+</html>
+'''
 
 @app.route('/favicon.ico')
 def favicon():
-    # 內嵌一個簡單的圖標回應，避免404
     return '', 204
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return render_template_string(HTML_TEMPLATE)
 
 @app.route('/status')
 def status():
