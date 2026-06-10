@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Webull 交易機器人 - 最終穩定版（含前端日誌、錯誤自動停止、模型相容）
+Webull 交易机器人 - 完整 Web 版（与 trade.py 策略完全一致）
+- 支持手机访问
+- 实时状态查看（持仓、余额、日志）
+- 远程启动/停止/强制平仓
+- 时间参数：高置信度15:00，禁止买入15:15，智能卖出15:15，强制平仓15:30
 """
 
 import os
 os.environ['TF_USE_LEGACY_KERAS'] = '1'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 import sys
 import time
 import pickle
 import json
 import logging
-import math
 import uuid
 import hashlib
 import hmac
@@ -22,7 +26,8 @@ import requests
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, time as dt_time, timezone
 from zoneinfo import ZoneInfo
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
+from functools import wraps
 
 import numpy as np
 import pandas as pd
@@ -39,7 +44,7 @@ from webull.core.exception.exceptions import ServerException
 
 load_dotenv()
 
-# ================== 全局配置 ==================
+# ================== 全局配置（与 trade.py 保持一致） ==================
 SYMBOLS = [
     'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META',
     'NVDA', 'AMD', 'TSLA', 'PLTR', 'DELL',
@@ -47,11 +52,17 @@ SYMBOLS = [
     'ISRG', 'OUST', 'IBM', 'MU', 'MRVL'
 ]
 
-MAX_SINGLE_POSITION_PCT = 1.0
-HARD_STOP_LOSS_PCT = 0.05
-ATR_STOP_MULTIPLIER = 2.0
+MAX_SINGLE_POSITION_PCT = 0.35
+USE_MARGIN = True
+ALLOW_ADDING_TO_EXISTING = False
+BUY_AMOUNT_PCT = 0.95
+SAFE_MARGIN = 1.0
+
+TAKE_PROFIT_PCT = 0.005
+STOP_LOSS_PCT = 0.005
+PROB_THRESHOLD_RISE_MARK = 0.60
+
 ATR_PERIOD = 14
-BUY_AMOUNT_PCT = 0.20
 PROB_THRESHOLD_BUY = 0.65
 HIGH_CONFIDENCE_THRESHOLD = 0.75
 PROB_THRESHOLD_SELL = 0.60
@@ -59,12 +70,24 @@ KLINE_INTERVAL = Timespan.M15.name
 CHECK_INTERVAL_SEC = 5
 SHORT_SUMMARY_INTERVAL_SEC = 10 * 60
 LONG_SUMMARY_INTERVAL_SEC = 30 * 60
-HIGH_CONFIDENCE_START_TIME = dt_time(14, 45)
-STOP_BUY_TIME = dt_time(15, 0)
-START_SELL_TIME = dt_time(15, 0)
-FORCE_SELL_TIME = dt_time(15, 15)
-RESERVED_FEE_PER_TRADE = 0.02
 
+# 时间参数（与 trade.py 一致）
+HIGH_CONFIDENCE_START_TIME = dt_time(15, 0)   # 15:00 后高置信度
+STOP_BUY_TIME = dt_time(15, 15)               # 15:15 后禁止买入
+START_SELL_TIME = dt_time(15, 15)             # 15:15 后智能卖出
+FORCE_SELL_TIME = dt_time(15, 30)             # 15:30 强制平仓
+
+RESERVED_FEE_PER_TRADE = 0.02
+MODEL_MAX_AGE_DAYS = 7
+
+RISK_LEVEL_SAFE_PCT = 0.35
+RISK_LEVEL_CAUTION_PCT = 0.15
+RISK_LEVEL_WARNING_PCT = 0.0
+RISK_LEVEL_CRITICAL = -0.15
+RISK_CHECK_INTERVAL_SEC = 5
+maintenance_margin_pct = 0.25
+
+# 特征列表（与 trade.py 完全相同）
 FEATURES = [
     'return_1d', 'return_5d', 'return_10d', 'return_20d',
     'sma5', 'sma10', 'sma20', 'sma50', 'sma200',
@@ -87,11 +110,11 @@ FEATURES = [
     'obv', 'obv_ratio', 'mfi'
 ]
 
-# ================== 日誌設定 ==================
+# ================== 日志系统（支持前端显示） ==================
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 log_handler = TimedRotatingFileHandler(
-    filename=os.path.join(LOG_DIR, "webull_final.log"),
+    filename=os.path.join(LOG_DIR, "webull_web.log"),
     when="midnight", interval=1, backupCount=90, encoding="utf-8"
 )
 log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
@@ -102,47 +125,15 @@ logger.setLevel(logging.INFO)
 logger.addHandler(log_handler)
 logger.addHandler(console)
 
-# 前端日誌列表
+# 前端日志队列
 ui_log_messages = []
-
-# 警告轉譯字典
-WARNING_TRANSLATION = {
-    'model missing': '模型檔案缺失',
-    'cannot load': '無法載入模型',
-    'token expired': '權杖已過期，請重新授權',
-    'connection failed': '連線失敗，請檢查網路',
-    'market closed': '美股休市中，機器人暫停交易',
-    'insufficient funds': '可用資金不足',
-    'order failed': '下單失敗',
-    'buy amount too small': '買入金額低於5美元',
-    'position limit exceeded': '持倉比例超過限制',
-}
-
-def translate_warning(msg: str) -> str:
-    msg_lower = msg.lower()
-    for en, zh in WARNING_TRANSLATION.items():
-        if en in msg_lower:
-            return zh
-    return f"⚠️ {msg}"
-
 def add_ui_log(level: str, msg: str):
-    """前端日誌過濾：只排除資產查詢等雜訊，保留所有狀態、交易、錯誤訊息"""
-    exclude_keywords = ['美元淨資產', '可用現金']
-    
-    if any(k in msg for k in exclude_keywords):
-        return
-    
-    if level == 'WARNING':
-        msg = translate_warning(msg)
-    elif level == 'ERROR':
-        msg = f"❌ 錯誤：{msg}"
-    
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now().strftime("%H:%M:%S")
     ui_log_messages.append({"time": timestamp, "level": level, "msg": msg})
-    while len(ui_log_messages) > 500:
+    while len(ui_log_messages) > 200:
         ui_log_messages.pop(0)
 
-# 覆蓋 logger
+# 包装 logger
 original_info = logger.info
 original_error = logger.error
 original_warning = logger.warning
@@ -159,14 +150,14 @@ def warning_with_ui(msg, *args, **kwargs):
     add_ui_log("WARNING", msg)
 def exception_with_ui(msg, *args, **kwargs):
     original_exception(msg, *args, **kwargs)
-    add_ui_log("ERROR", f"嚴重異常：{msg}")
+    add_ui_log("ERROR", f"异常: {msg}")
 
 logger.info = info_with_ui
 logger.error = error_with_ui
 logger.warning = warning_with_ui
 logger.exception = exception_with_ui
 
-# ================== 全局狀態 ==================
+# ================== 全局变量 ==================
 stop_event = threading.Event()
 bot_thread = None
 thread_lock = threading.Lock()
@@ -175,8 +166,9 @@ data_client = None
 models = {}
 webull_username = "未知"
 account_id = None
+position_tracker = None  # 将在 bot_loop 中初始化
 
-# ================== 時間輔助 ==================
+# ================== 时间辅助函数 ==================
 def get_current_et() -> datetime:
     return datetime.now(ZoneInfo("America/New_York"))
 
@@ -201,10 +193,10 @@ def is_sell_allowed(now_time: dt_time) -> bool:
 def is_force_sell_time(now_time: dt_time) -> bool:
     return now_time >= FORCE_SELL_TIME
 
-# ================== Webull 客戶端初始化（修正用戶名獲取） ==================
+# ================== Webull 客户端初始化 ==================
 def init_webull_clients() -> Tuple[TradeClient, DataClient, str, str]:
     global webull_username, account_id
-    logger.info("正在初始化 Webull 客戶端...")
+    logger.info("正在初始化 Webull 客户端...")
     app_key = os.getenv("WEBULL_APP_KEY")
     app_secret = os.getenv("WEBULL_APP_SECRET")
     region_id = os.getenv("WEBULL_REGION_ID", "hk")
@@ -219,37 +211,35 @@ def init_webull_clients() -> Tuple[TradeClient, DataClient, str, str]:
     trade_client = TradeClient(api_client)
     data_client = DataClient(api_client)
     
-    # 獲取 account_id
+    # 获取账户ID
     resp = trade_client.account_v2.get_account_list()
     accounts = resp.json()
     if not accounts:
-        raise ValueError("無法獲取帳戶列表")
+        raise ValueError("无法获取账户列表")
     account_id = accounts[0].get("account_id")
     if not account_id:
         raise ValueError("account_id 不存在")
-    logger.info(f"獲取到 account_id: {account_id}")
+    logger.info(f"获取到 account_id: {account_id}")
     
-    # 嘗試獲取用戶名（從帳戶列表中取 account_name 或透過 profile）
+    # 获取用户名（尝试多种方式）
     try:
-        # 方法1: 直接從帳戶列表取 account_name
         webull_username = accounts[0].get("account_name", "未知")
         if webull_username == "未知":
-            # 方法2: 嘗試 get_account_profile (如果存在的話)
             try:
                 profile_resp = trade_client.account_v2.get_account_profile(account_id)
                 if profile_resp.status_code == 200:
                     profile_data = profile_resp.json()
                     webull_username = profile_data.get("account_number", "未知")
-            except Exception:
+            except:
                 pass
-        logger.info(f"Webull 連線成功，帳戶：{webull_username}")
+        logger.info(f"Webull 连接成功，账户：{webull_username}")
     except Exception as e:
         webull_username = "未知"
-        logger.warning(f"取得帳戶名稱失敗: {e}")
+        logger.warning(f"获取账户名称失败: {e}")
     
     return trade_client, data_client, webull_username, account_id
 
-# ================== 行情數據 ==================
+# ================== 市场数据函数（完全复制自 trade.py） ==================
 def get_market_data(data_client: DataClient, symbol: str, count=300) -> pd.DataFrame:
     try:
         full_symbol = symbol
@@ -281,10 +271,10 @@ def get_market_data(data_client: DataClient, symbol: str, count=300) -> pd.DataF
                     df[col] = pd.to_numeric(df[col], errors='coerce')
             return df.sort_values('time_key').reset_index(drop=True)
         else:
-            logger.warning(f"獲取 {symbol} K線失敗 HTTP {res.status_code}")
+            logger.warning(f"获取 {symbol} K线失败 HTTP {res.status_code}")
             return pd.DataFrame()
     except Exception as e:
-        logger.warning(f"獲取 {symbol} K線異常: {e}")
+        logger.warning(f"获取 {symbol} K线异常: {e}")
         return pd.DataFrame()
 
 def get_real_time_price(data_client: DataClient, symbol: str) -> Optional[float]:
@@ -299,61 +289,91 @@ def get_real_time_price(data_client: DataClient, symbol: str) -> Optional[float]
     except Exception:
         return None
 
-# ================== 帳戶與持倉 ==================
-def get_account_balance(trade_client: TradeClient) -> Tuple[float, float]:
+def get_account_balance(trade_client: TradeClient) -> Tuple[float, float, float]:
+    """返回 (净资产, 现金, 购买力)"""
     try:
         resp = trade_client.account_v2.get_account_list()
         accounts = resp.json()
         if not accounts:
-            return 0, 0
-        aid = accounts[0].get("account_id")
-        bal_resp = trade_client.account_v2.get_account_balance(aid)
+            return 0, 0, 0
+        account_id = accounts[0].get("account_id")
+        bal_resp = trade_client.account_v2.get_account_balance(account_id)
         bal_data = bal_resp.json()
+
         usd_cash = 0.0
         usd_net = 0.0
-        if "account_currency_assets" in bal_data:
-            for asset in bal_data["account_currency_assets"]:
-                if asset.get("currency") == "USD":
-                    usd_cash = float(asset.get("cash_balance", 0))
-                    usd_net = float(asset.get("net_liquidation_value", 0))
-                    break
-        available = max(usd_cash - RESERVED_FEE_PER_TRADE, 0)
-        logger.debug(f"美元淨資產: ${usd_net:,.2f}, 可用現金: ${available:,.2f}")
-        return usd_net, available
+        buying_power = 0.0
+
+        if isinstance(bal_data, dict):
+            usd_net = float(bal_data.get("total_net_liquidation_value", 0))
+            if "account_currency_assets" in bal_data:
+                for asset in bal_data["account_currency_assets"]:
+                    if asset.get("currency") == "USD":
+                        usd_cash = float(asset.get("cash_balance", 0))
+                        buying_power = float(asset.get("buying_power", 0))
+                        break
+        effective_buying_power = max(0, buying_power - SAFE_MARGIN) if USE_MARGIN else usd_cash
+        available_cash = max(usd_cash - RESERVED_FEE_PER_TRADE, 0)
+        return usd_net, available_cash, effective_buying_power
     except Exception as e:
-        logger.error(f"獲取帳戶餘額失敗: {e}")
-        return 0, 0
+        logger.error(f"获取账户余额失败: {e}")
+        return 0, 0, 0
 
 def get_positions(trade_client: TradeClient) -> pd.DataFrame:
+    """完整持仓解析（支持碎股）"""
     try:
         resp = trade_client.account_v2.get_account_list()
         accounts = resp.json()
         if not accounts:
             return pd.DataFrame()
-        aid = accounts[0].get("account_id")
-        pos_resp = trade_client.account_v2.get_account_position(aid)
+        account_id = accounts[0].get("account_id")
+        pos_resp = trade_client.account_v2.get_account_position(account_id)
         positions = pos_resp.json()
         if not positions:
             return pd.DataFrame()
+        
         rows = []
         for pos in positions:
-            rows.append({
-                'symbol': pos.get('symbol'),
-                'qty': float(pos.get('position', 0)),
-                'cost_price': float(pos.get('costPrice', 0)),
-            })
+            qty = 0.0
+            # 尝试多种字段
+            for key in ['position', 'quantity', 'qty', 'shares', 'totalQuantity', 'currentQty', 'fractionalQty', 'oddLotQuantity']:
+                if key in pos:
+                    try:
+                        val = pos[key]
+                        if val is None:
+                            continue
+                        qty = float(val)
+                        if qty != 0:
+                            break
+                    except:
+                        continue
+            if qty == 0:
+                continue
+            cost = 0.0
+            for key in ['costPrice', 'cost_price', 'avgPrice', 'averagePrice']:
+                if key in pos:
+                    try:
+                        cost = float(pos[key])
+                        break
+                    except:
+                        continue
+            symbol = pos.get('symbol', '')
+            if symbol:
+                rows.append({'symbol': symbol, 'qty': qty, 'cost_price': cost})
         return pd.DataFrame(rows)
     except Exception as e:
-        logger.debug(f"獲取持倉時臨時錯誤: {e}")
+        logger.error(f"获取持仓异常: {e}")
         return pd.DataFrame()
 
-# ================== 下單函數 ==================
+# ================== 下单函数（与 trade.py 一致） ==================
 def place_buy_order(trade_client: TradeClient, symbol: str, amount_usd: float) -> Tuple[bool, str, Optional[str]]:
-    if amount_usd < 5.0:
-        return False, f"買入金額 ${amount_usd:.2f} < 5 美元", None
-    _, available = get_account_balance(trade_client)
-    if available < amount_usd:
-        return False, "可用美元資金不足", None
+    if amount_usd < 1.0:
+        return False, f"金额 ${amount_usd:.2f} < 1 美元", None
+    _, _, buying_power = get_account_balance(trade_client)
+    if buying_power < amount_usd:
+        return False, f"购买力不足：需要 ${amount_usd:.2f}，可用 ${buying_power:.2f}", None
+
+    logger.info(f"📈 融资买入: ${amount_usd:.2f} (可用 ${buying_power:.2f})")
 
     try:
         token_file = os.path.join("conf", "token.txt")
@@ -422,18 +442,18 @@ def place_buy_order(trade_client: TradeClient, symbol: str, amount_usd: float) -
         if response.status_code == 200:
             result = response.json()
             order_id = result.get('order_id')
-            logger.info(f"✅ 買入成功: ${amount_usd:.2f} -> {symbol} (訂單 {order_id})")
+            logger.info(f"✅ 买入成功: ${amount_usd:.2f} -> {symbol} (订单 {order_id})")
             return True, "成功", order_id
         else:
-            logger.error(f"買入失敗 HTTP {response.status_code}: {response.text}")
+            logger.error(f"买入失败 HTTP {response.status_code}: {response.text}")
             return False, f"HTTP {response.status_code}", None
     except Exception as e:
-        logger.error(f"買入下單異常: {e}")
+        logger.error(f"买入异常: {e}")
         return False, str(e), None
 
 def place_sell_order(trade_client: TradeClient, symbol: str, qty: float) -> Tuple[bool, str, Optional[str]]:
-    if qty <= 0:
-        return False, "數量無效", None
+    if qty <= 1e-8:
+        return False, f"数量 {qty:.10f} 过小，视为无效", None
 
     try:
         token_file = os.path.join("conf", "token.txt")
@@ -499,69 +519,91 @@ def place_sell_order(trade_client: TradeClient, symbol: str, qty: float) -> Tupl
 
         url = f"https://api.webull.hk{uri}"
         response = requests.post(url, data=body_json, headers=headers)
+
         if response.status_code == 200:
             result = response.json()
             order_id = result.get('order_id')
-            logger.info(f"✅ 賣出成功: {qty:.4f} 股 {symbol} (訂單 {order_id})")
+            logger.info(f"✅ 卖出成功: {qty:.6f} 股 {symbol} (订单 {order_id})")
             return True, "成功", order_id
         else:
-            logger.error(f"賣出失敗 HTTP {response.status_code}: {response.text}")
+            error_text = response.text
+            logger.error(f"卖出失败 HTTP {response.status_code}: {error_text}")
+            if ("ORDER_ODD_LOT_SELL_QUANTITY_INVALID" in error_text or
+                "CAN_SELL_QTY_NOT_ENOUGH" in error_text):
+                logger.warning(f"⚠️ 碎股卖出失败，尝试卖出全部持仓 {symbol}")
+                pos_df = get_positions(trade_client)
+                row = pos_df[pos_df['symbol'] == symbol]
+                if not row.empty:
+                    fallback_qty = row.iloc[0]['qty']
+                    if fallback_qty > 1e-8:
+                        logger.info(f"🔄 兜底卖出: {symbol} 全部 {fallback_qty:.6f} 股")
+                        return place_sell_order(trade_client, symbol, fallback_qty)
             return False, f"HTTP {response.status_code}", None
     except Exception as e:
-        logger.error(f"賣出下單異常: {e}")
+        logger.error(f"卖出异常: {e}")
         return False, str(e), None
 
-# ================== 技術指標 ==================
+# ================== 技术指标计算（完整版） ==================
 def compute_technical_features(df: pd.DataFrame) -> pd.DataFrame:
-    # 此函數內容與原始相同，省略重複程式碼（實際使用時請保留完整實作）
     df = df.copy()
     df['return_1d'] = df['close'].pct_change(1)
     df['return_5d'] = df['close'].pct_change(5)
     df['return_10d'] = df['close'].pct_change(10)
     df['return_20d'] = df['close'].pct_change(20)
+
     for period in [5, 10, 20, 50, 200]:
         df[f'sma{period}'] = df['close'].rolling(period).mean()
     df['sma5_sma20_ratio'] = df['sma5'] / df['sma20'] - 1
     df['sma10_sma50_ratio'] = df['sma10'] / df['sma50'] - 1
     df['close_sma20_ratio'] = df['close'] / df['sma20'] - 1
     df['close_sma50_ratio'] = df['close'] / df['sma50'] - 1
+
     for period in [7, 14, 21]:
         delta = df['close'].diff()
         gain = delta.where(delta > 0, 0).rolling(period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
         rs = gain / loss
         df[f'rsi_{period}'] = 100 - (100 / (1 + rs))
+
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
     low_close = (df['low'] - df['close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['atr'] = tr.rolling(ATR_PERIOD).mean()
     df['atr_pct'] = df['atr'] / df['close']
+
     df['bb_mid'] = df['close'].rolling(20).mean()
     df['bb_std'] = df['close'].rolling(20).std()
     df['bb_width'] = (2 * df['bb_std']) / df['bb_mid']
     df['bb_position'] = (df['close'] - df['bb_mid']) / (2 * df['bb_std'] + 1e-8)
+
     exp1 = df['close'].ewm(span=12, adjust=False).mean()
     exp2 = df['close'].ewm(span=26, adjust=False).mean()
     df['macd'] = exp1 - exp2
     df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
     df['macd_diff'] = df['macd'] - df['macd_signal']
+
     df['volume_ma'] = df['volume'].rolling(20).mean()
     df['volume_ratio'] = df['volume'] / (df['volume_ma'] + 1e-8)
     df['volume_ma_ratio'] = df['volume_ma'] / (df['volume_ma'].shift(1) + 1e-8) - 1
+
     df['vwap'] = (df['volume'] * df['close']).rolling(20).sum() / (df['volume'].rolling(20).sum() + 1e-8)
     df['vwap_ratio'] = df['close'] / df['vwap'] - 1
+
     df['body_ratio'] = abs(df['close'] - df['open']) / (df['high'] - df['low'] + 1e-8)
     df['upper_shadow_ratio'] = (df['high'] - df[['close', 'open']].max(axis=1)) / (df['high'] - df['low'] + 1e-8)
     df['lower_shadow_ratio'] = (df[['close', 'open']].min(axis=1) - df['low']) / (df['high'] - df['low'] + 1e-8)
     df['high_low_ratio'] = (df['high'] - df['low']) / df['close']
     df['open_close_ratio'] = (df['close'] - df['open']) / df['open']
+
     df['volatility_10'] = df['return_1d'].rolling(10).std()
     df['volatility_20'] = df['return_1d'].rolling(20).std()
+
     df['time_key'] = pd.to_datetime(df['time_key'])
     df['hour'] = df['time_key'].dt.hour
     df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
     df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+
     df['atr_adx'] = tr.rolling(14).mean()
     df['plus_dm'] = ((df['high'] - df['high'].shift(1)) > (df['low'].shift(1) - df['low'])) * (df['high'] - df['high'].shift(1)).clip(lower=0)
     df['minus_dm'] = ((df['low'].shift(1) - df['low']) > (df['high'] - df['high'].shift(1))) * (df['low'].shift(1) - df['low']).clip(lower=0)
@@ -569,12 +611,15 @@ def compute_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     df['minus_di'] = 100 * (df['minus_dm'].rolling(14).mean() / (df['atr_adx'] + 1e-8))
     df['dx'] = 100 * abs(df['plus_di'] - df['minus_di']) / (df['plus_di'] + df['minus_di'] + 1e-8)
     df['adx'] = df['dx'].rolling(14).mean()
+
     df['golden_cross_5_20'] = ((df['sma5'] > df['sma20']) & (df['sma5'].shift(1) <= df['sma20'].shift(1))).astype(int)
     df['death_cross_5_20'] = ((df['sma5'] < df['sma20']) & (df['sma5'].shift(1) >= df['sma20'].shift(1))).astype(int)
     df['golden_cross_20_50'] = ((df['sma20'] > df['sma50']) & (df['sma20'].shift(1) <= df['sma50'].shift(1))).astype(int)
     df['death_cross_20_50'] = ((df['sma20'] < df['sma50']) & (df['sma20'].shift(1) >= df['sma50'].shift(1))).astype(int)
+
     df['williams_r'] = -100 * (df['high'].rolling(14).max() - df['close']) / (df['high'].rolling(14).max() - df['low'].rolling(14).min() + 1e-8)
     df['cci'] = (df['close'] - df['close'].rolling(20).mean()) / (0.015 * df['close'].rolling(20).std() + 1e-8)
+
     df['obv'] = (np.sign(df['close'].diff()) * df['volume']).cumsum()
     df['obv_ratio'] = df['obv'] / (df['obv'].abs().max() + 1e-8)
     tp = (df['high'] + df['low'] + df['close']) / 3
@@ -582,19 +627,18 @@ def compute_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     pos_flow = money_flow.where(df['close'] > df['close'].shift(1), 0).rolling(14).sum()
     neg_flow = money_flow.where(df['close'] < df['close'].shift(1), 0).rolling(14).sum()
     df['mfi'] = 100 - 100 / (1 + pos_flow / (neg_flow + 1e-8))
+
     df.drop(columns=['hour', 'atr_adx', 'dx'], errors='ignore', inplace=True)
     return df.dropna().reset_index(drop=True)
 
-# ================== 模型載入（完整相容舊版） ==================
+# ================== 模型加载与预测 ==================
 class CompatibleInputLayer(tf.keras.layers.InputLayer):
-    """自訂 InputLayer 以忽略 batch_shape 和 optional 參數"""
     def __init__(self, **kwargs):
         kwargs.pop('batch_shape', None)
         kwargs.pop('optional', None)
         super().__init__(**kwargs)
 
 class DummyDTypePolicy:
-    """模擬舊版的 DTypePolicy，提供所有可能被調用的屬性和方法"""
     def __init__(self, name='float32'):
         self._name = name
     @property
@@ -611,24 +655,23 @@ class DummyDTypePolicy:
 
 def load_models() -> Dict[str, Tuple]:
     models_dict = {}
-    logger.info("開始載入模型...")
+    logger.info("开始加载模型...")
     for symbol in SYMBOLS:
         xgb_path = f"models/US.{symbol}_xgb.pkl"
         lstm_path = f"models/US.{symbol}_lstm.h5"
         scaler_path = f"models/US.{symbol}_scaler.pkl"
         if not (os.path.exists(xgb_path) and os.path.exists(lstm_path) and os.path.exists(scaler_path)):
-            logger.warning(f"模型缺失: {symbol}，跳過")
+            logger.warning(f"模型缺失: {symbol}，跳过")
             continue
         with open(xgb_path, 'rb') as f:
             xgb_model = pickle.load(f)
         
         lstm_model = None
         try:
-            # 嘗試直接載入
             lstm_model = tf.keras.models.load_model(lstm_path, compile=False)
-            logger.info(f"直接載入 {symbol} LSTM 成功")
+            logger.info(f"直接加载 {symbol} LSTM 成功")
         except Exception as e:
-            logger.warning(f"載入 {symbol} LSTM 遇到錯誤: {e}，嘗試使用自定義物件")
+            logger.warning(f"加载 {symbol} LSTM 遇到错误: {e}，尝试使用自定义对象")
             try:
                 custom_objects = {
                     'InputLayer': CompatibleInputLayer,
@@ -639,16 +682,16 @@ def load_models() -> Dict[str, Tuple]:
                     compile=False,
                     custom_objects=custom_objects
                 )
-                logger.info(f"使用自定義物件載入 {symbol} LSTM 成功")
+                logger.info(f"使用自定义对象加载 {symbol} LSTM 成功")
             except Exception as e2:
-                logger.error(f"仍無法載入 {symbol} LSTM: {e2}，跳過此股票")
+                logger.error(f"仍无法加载 {symbol} LSTM: {e2}，跳过此股票")
                 continue
         
         with open(scaler_path, 'rb') as f:
             scaler = pickle.load(f)
         models_dict[symbol] = (xgb_model, lstm_model, scaler)
-        logger.info(f"成功載入模型: {symbol}")
-    logger.info(f"模型載入完成，共 {len(models_dict)} 支股票")
+        logger.info(f"成功加载模型: {symbol}")
+    logger.info(f"模型加载完成，共 {len(models_dict)} 支股票")
     return models_dict
 
 def predict_probability(data_client: DataClient, symbol: str, xgb_model, lstm_model, scaler) -> float:
@@ -669,221 +712,279 @@ def predict_probability(data_client: DataClient, symbol: str, xgb_model, lstm_mo
         lstm_prob = 0.5
     return 0.6 * xgb_prob + 0.4 * lstm_prob
 
-# ================== 持倉追蹤器 ==================
+# ================== 持仓追踪器 ==================
 class PositionTracker:
     def __init__(self):
         self.positions = {}
+        self.pending_sell = {}
+
     def add(self, symbol: str, entry_price: float, entry_atr: float):
         self.positions[symbol] = {'entry_price': entry_price, 'entry_atr': entry_atr, 'highest_price': entry_price}
+        self.pending_sell.pop(symbol, None)
+
     def remove(self, symbol: str):
         self.positions.pop(symbol, None)
+        self.pending_sell.pop(symbol, None)
+
     def update_high(self, symbol: str, current_price: float):
         if symbol in self.positions and current_price > self.positions[symbol]['highest_price']:
             self.positions[symbol]['highest_price'] = current_price
+
     def get_info(self, symbol: str):
         return self.positions.get(symbol)
 
+    def set_pending_sell(self, symbol: str, mark_price: float):
+        self.pending_sell[symbol] = {'mark_price': mark_price, 'mark_time': time.time()}
+
+    def get_pending_sell(self, symbol: str):
+        return self.pending_sell.get(symbol)
+
+    def clear_pending_sell(self, symbol: str):
+        self.pending_sell.pop(symbol, None)
+
 def check_exit_conditions(tracker: PositionTracker, trade_client: TradeClient, data_client: DataClient,
-                          symbol: str, current_price: float, df: pd.DataFrame, sell_prob: float, now_time: dt_time) -> Tuple[bool, str, Optional[float]]:
+                          symbol: str, current_price: float, df: pd.DataFrame, buy_prob: float, now_time: dt_time) -> Tuple[bool, str, Optional[float]]:
     info = tracker.get_info(symbol)
     if info is None:
-        return False, "無持倉", None
+        return False, "无持仓", None
     entry_price = info['entry_price']
-    entry_atr = info.get('entry_atr', 0)
-    highest_price = info['highest_price']
     profit_loss_pct = (current_price - entry_price) / entry_price
 
     pos_df = get_positions(trade_client)
     row = pos_df[pos_df['symbol'] == symbol]
     if row.empty:
-        return False, "無持倉", None
+        return False, "无持仓", None
     qty = row.iloc[0]['qty']
 
-    if profit_loss_pct <= -HARD_STOP_LOSS_PCT:
-        return True, f"硬止損 (虧損 {profit_loss_pct*100:.2f}%)", qty
-    if entry_atr > 0 and highest_price > entry_price:
-        stop_price = highest_price - ATR_STOP_MULTIPLIER * entry_atr
-        if current_price <= stop_price:
-            return True, "ATR移動止損", qty
+    # 固定止盈止损
+    if profit_loss_pct >= TAKE_PROFIT_PCT:
+        tracker.clear_pending_sell(symbol)
+        return True, f"止盈 (盈利 {profit_loss_pct*100:.2f}%)", qty
+
+    if profit_loss_pct <= -STOP_LOSS_PCT:
+        tracker.clear_pending_sell(symbol)
+        return True, f"止损 (亏损 {profit_loss_pct*100:.2f}%)", qty
+
+    # 智能卖出（标记确认）
+    if is_sell_allowed(now_time):
+        pending = tracker.get_pending_sell(symbol)
+        if buy_prob > PROB_THRESHOLD_RISE_MARK and pending is None:
+            tracker.set_pending_sell(symbol, current_price)
+            logger.info(f"  {symbol} 预测上涨 {buy_prob*100:.1f}% > 60%，标记待确认 (标记价 {current_price:.2f})")
+            return False, None, None
+        elif pending is not None:
+            if current_price > pending['mark_price']:
+                rise_pct = (current_price - pending['mark_price']) / pending['mark_price']
+                tracker.clear_pending_sell(symbol)
+                return True, f"智能卖出 (确认上涨，涨 {rise_pct*100:.2f}%)", qty
+            elif buy_prob <= PROB_THRESHOLD_RISE_MARK:
+                tracker.clear_pending_sell(symbol)
+                logger.info(f"  {symbol} 预测概率回落至 {buy_prob*100:.1f}%，取消标记")
+                return False, None, None
+
+    # 预测下跌卖出
+    sell_prob = 1 - buy_prob
     if is_sell_allowed(now_time) and sell_prob >= PROB_THRESHOLD_SELL:
-        return True, f"智能賣出 (預測下跌 {sell_prob*100:.1f}%)", qty
-    if sell_prob >= PROB_THRESHOLD_SELL and profit_loss_pct > 0:
-        return True, f"ML止盈 (預測下跌 {sell_prob*100:.1f}%)", qty
+        tracker.clear_pending_sell(symbol)
+        return True, f"智能卖出 (预测下跌 {sell_prob*100:.1f}%)", qty
+
+    # 死叉卖出
     if len(df) >= 50:
         sma_short = df['close'].rolling(12).mean().iloc[-1]
         sma_long = df['close'].rolling(26).mean().iloc[-1]
         prev_short = df['close'].rolling(12).mean().iloc[-2]
         prev_long = df['close'].rolling(26).mean().iloc[-2]
         if prev_short >= prev_long and sma_short < sma_long:
-            return True, "死叉賣出", qty
+            tracker.clear_pending_sell(symbol)
+            return True, "死叉卖出", qty
+
     tracker.update_high(symbol, current_price)
     return False, None, None
 
-def force_close_all(trade_client: TradeClient):
+def force_close_all(trade_client: TradeClient, tracker: PositionTracker) -> int:
     pos_df = get_positions(trade_client)
+    if pos_df.empty:
+        logger.info("无持仓需要平仓")
+        return 0
+    closed = 0
     for _, row in pos_df.iterrows():
         symbol = row['symbol']
-        qty = row['qty']
-        logger.info(f"強制平倉: {symbol} {qty:.4f} 股")
-        place_sell_order(trade_client, symbol, qty)
+        qty = float(row['qty'])
+        if qty <= 1e-8:
+            logger.warning(f"跳过 {symbol}: 数量 {qty:.10f} 过小")
+            continue
+        logger.warning(f"🏳️ 强制平仓: 尝试卖出 {symbol} {qty:.6f} 股")
+        success, msg, oid = place_sell_order(trade_client, symbol, qty)
+        if success:
+            tracker.remove(symbol)
+            closed += 1
+            logger.info(f"✅ 已卖出 {symbol} {qty:.6f} 股")
+        else:
+            logger.error(f"❌ 平仓失败 {symbol}: {msg}")
+    logger.warning(f"强制平仓完成，共平仓 {closed} 个持仓")
+    return closed
 
-# ================== 機器人主循環（含狀態提示） ==================
+# ================== 机器人主循环 ==================
 def bot_loop():
-    global stop_event, trade_client, data_client, models
-    logger.info("機器人執行緒啟動，開始交易循環")
+    global stop_event, trade_client, data_client, models, position_tracker
+    logger.info("机器人线程启动，开始交易循环")
     tracker = PositionTracker()
-    
-    last_waiting_msg_time = 0
-    last_high_conf_mode = False
-    last_stop_buy_mode = False
-    last_start_sell_mode = False
-    last_force_sell_mode = False
-    
-    # 同步現有持倉
+    position_tracker = tracker  # 供强制平仓调用
+
+    # 同步现有持仓
     try:
         pos_df = get_positions(trade_client)
         for _, row in pos_df.iterrows():
             symbol = row['symbol']
             if symbol in models:
                 cost = row['cost_price']
+                if cost == 0:
+                    price = get_real_time_price(data_client, symbol)
+                    if price:
+                        cost = price
                 df = get_market_data(data_client, symbol, 200)
                 atr_val = df['atr'].iloc[-1] if not df.empty and 'atr' in df.columns else 0
                 tracker.add(symbol, cost, atr_val)
-                logger.info(f"同步現有持倉 {symbol} 成本 {cost:.2f}")
+                logger.info(f"同步现有持仓 {symbol} 成本 {cost:.2f} 数量 {row['qty']:.6f}")
     except Exception as e:
-        logger.exception(f"同步持倉失敗: {e}")
+        logger.exception(f"同步持仓失败: {e}")
         stop_event.set()
         return
 
-    try:
-        while not stop_event.is_set():
-            try:
-                now_et = get_current_et()
-                now_time = now_et.time()
-                
-                # 模式切換提醒
-                high_conf_active = now_time >= HIGH_CONFIDENCE_START_TIME
-                stop_buy_active = now_time >= STOP_BUY_TIME
-                start_sell_active = now_time >= START_SELL_TIME
-                force_sell_active = now_time >= FORCE_SELL_TIME
-                
-                if high_conf_active and not last_high_conf_mode:
-                    logger.info("🔔 已進入高信賴度買入模式 (14:45後，買入需 ≥75% 信心)")
-                elif not high_conf_active and last_high_conf_mode and now_time.hour < 14:
-                    logger.info("🔔 已離開高信賴度買入模式")
-                last_high_conf_mode = high_conf_active
-                
-                if stop_buy_active and not last_stop_buy_mode:
-                    logger.info("⛔ 已到達停止買入時間 15:00，禁止新買入")
-                last_stop_buy_mode = stop_buy_active
-                
-                if start_sell_active and not last_start_sell_mode:
-                    logger.info("💰 已到達開始賣出時間 15:00，啟用智能賣出")
-                last_start_sell_mode = start_sell_active
-                
-                if force_sell_active and not last_force_sell_mode:
-                    logger.info("⚠️ 已到達強制平倉時間 15:15，將平倉所有持倉")
-                last_force_sell_mode = force_sell_active
-                
-                market_open = is_us_market_open()
-                if not market_open:
-                    if time.time() - last_waiting_msg_time > 60:
-                        logger.info("⏳ 美股尚未開盤（美東時間 9:30-16:00），機器人等待中...")
-                        last_waiting_msg_time = time.time()
-                    for _ in range(CHECK_INTERVAL_SEC):
-                        if stop_event.is_set():
-                            break
-                        time.sleep(1)
-                    continue
-                else:
-                    last_waiting_msg_time = 0
-                    if not hasattr(bot_loop, "_market_open_just_entered"):
-                        logger.info("📈 美股已開盤，機器人開始掃描標的")
-                        bot_loop._market_open_just_entered = True
-                
-                if is_force_sell_time(now_time):
-                    logger.info("到達強制平倉時間 15:15，平倉所有持倉")
-                    force_close_all(trade_client)
-                    stop_event.set()
-                    break
+    last_short = time.time()
+    last_long = time.time()
+    
+    while not stop_event.is_set():
+        try:
+            now_ts = time.time()
+            if not is_us_market_open():
+                time.sleep(CHECK_INTERVAL_SEC)
+                continue
 
-                total, available = get_account_balance(trade_client)
-                pos_df = get_positions(trade_client)
-                current_holdings = {row['symbol']: row['qty'] for _, row in pos_df.iterrows()}
+            now_et = get_current_et()
+            now_time = now_et.time()
 
-                for symbol in SYMBOLS:
-                    if stop_event.is_set():
-                        break
-                    if symbol not in models:
-                        continue
-                    logger.info(f"分析 {symbol}")
-                    df = get_market_data(data_client, symbol, 300)
-                    if df.empty:
-                        continue
-                    current_price = df['close'].iloc[-1]
-                    xgb_model, lstm_model, scaler = models[symbol]
-                    buy_prob = predict_probability(data_client, symbol, xgb_model, lstm_model, scaler)
-                    sell_prob = 1 - buy_prob
-                    logger.info(f"  {symbol} 上漲概率: {buy_prob:.3f}")
-
-                    holding_qty = current_holdings.get(symbol, 0)
-
-                    if holding_qty > 0:
-                        should_sell, reason, qty = check_exit_conditions(
-                            tracker, trade_client, data_client, symbol, current_price, df, sell_prob, now_time
-                        )
-                        if should_sell:
-                            logger.info(f"賣出 {symbol}: {reason}")
-                            success, msg, oid = place_sell_order(trade_client, symbol, qty)
-                            if success:
-                                tracker.remove(symbol)
-                                time.sleep(0.5)
-                            else:
-                                logger.error(f"賣出失敗: {msg}")
-                            continue
-
-                    if holding_qty == 0:
-                        if is_buy_allowed(now_time, buy_prob):
-                            if available <= 0:
-                                logger.info(f"  {symbol} 買入信號，但美元現金為0")
-                                continue
-                            buy_amount = available * BUY_AMOUNT_PCT
-                            if buy_amount < 5.0:
-                                logger.info(f"  {symbol} 買入信號，但資金不足（需要至少 $5）")
-                                continue
-                            effective_total = total if total > 0 else available
-                            new_ratio = buy_amount / (effective_total + buy_amount)
-                            if new_ratio > MAX_SINGLE_POSITION_PCT:
-                                logger.info(f"  {symbol} 買入會導致倉位超限 {new_ratio:.1%} > {MAX_SINGLE_POSITION_PCT:.0%}")
-                                continue
-                            logger.info(f"🎯 買入信號 {symbol} 價格 {current_price:.2f} 概率 {buy_prob:.3f} 金額 ${buy_amount:.2f}")
-                            success, msg, oid = place_buy_order(trade_client, symbol, buy_amount)
-                            if success:
-                                atr_val = df['atr'].iloc[-1] if 'atr' in df.columns else 0
-                                tracker.add(symbol, current_price, atr_val)
-                                available -= buy_amount
-                            else:
-                                logger.error(f"買入失敗: {msg}")
-                    time.sleep(0.8)
-
-                logger.info("完成一輪掃描，等待5秒")
-                for _ in range(CHECK_INTERVAL_SEC):
-                    if stop_event.is_set():
-                        break
-                    time.sleep(1)
-            except Exception as inner_e:
-                logger.exception(f"交易循環內部發生嚴重錯誤: {inner_e}")
-                logger.error("因嚴重錯誤，機器人將自動停止以避免潛在虧損")
+            if is_force_sell_time(now_time):
+                logger.info("⏰ 15:30 强制平仓")
+                force_close_all(trade_client, tracker)
                 stop_event.set()
                 break
-    except Exception as e:
-        logger.exception(f"機器人主循環發生嚴重錯誤: {e}")
-        logger.error("因嚴重錯誤，機器人已自動停止")
-        stop_event.set()
-    finally:
-        logger.info("機器人執行緒已停止")
 
-# ================== Flask Web 服務（內嵌 HTML） ==================
+            total, cash, buying_power = get_account_balance(trade_client)
+
+            if now_ts - last_long >= LONG_SUMMARY_INTERVAL_SEC:
+                # 完整摘要
+                pos_df = get_positions(trade_client)
+                logger.info(f"📊 详细摘要 | 净资产: ${total:.2f} | 持仓 {len(pos_df)} 只")
+                last_long, last_short = now_ts, now_ts
+            elif now_ts - last_short >= SHORT_SUMMARY_INTERVAL_SEC:
+                pos_df = get_positions(trade_client)
+                logger.info(f"📊 简短摘要 | 净资产: ${total:.2f} | 持仓 {len(pos_df)} 只")
+                last_short = now_ts
+
+            pos_df = get_positions(trade_client)
+            current_holdings = {row['symbol']: row['qty'] for _, row in pos_df.iterrows()}
+
+            for symbol in SYMBOLS:
+                if stop_event.is_set():
+                    break
+                if symbol not in models:
+                    continue
+                logger.info(f"🔍 分析 {symbol}")
+                df = get_market_data(data_client, symbol, 300)
+                if df.empty:
+                    continue
+                current_price = df['close'].iloc[-1]
+                xgb, lstm, scaler = models[symbol]
+                buy_prob = predict_probability(data_client, symbol, xgb, lstm, scaler)
+                logger.info(f"  {symbol} 上涨概率: {buy_prob:.3f}")
+
+                current_qty = current_holdings.get(symbol, 0)
+                current_market_value = current_qty * current_price
+                current_ratio = current_market_value / buying_power if buying_power > 0 else 0.0
+
+                # 更新或初始化持仓信息
+                if current_qty > 0 and symbol not in tracker.positions:
+                    cost = pos_df[pos_df['symbol'] == symbol]['cost_price'].values[0]
+                    if cost == 0:
+                        cost = current_price
+                    atr_val = df['atr'].iloc[-1] if 'atr' in df.columns else 0
+                    tracker.add(symbol, cost, atr_val)
+                    logger.info(f"初始化持仓信息 {symbol} 成本 {cost:.2f} 数量 {current_qty:.6f}")
+
+                # 卖出逻辑
+                if current_qty > 0:
+                    should_sell, reason, qty_to_sell = check_exit_conditions(
+                        tracker, trade_client, data_client, symbol, current_price, df, buy_prob, now_time
+                    )
+                    if should_sell:
+                        logger.info(f"卖出 {symbol}: {reason}")
+                        success, msg, oid = place_sell_order(trade_client, symbol, qty_to_sell)
+                        if success:
+                            tracker.remove(symbol)
+                            time.sleep(0.5)
+                            total, cash, buying_power = get_account_balance(trade_client)
+                        continue
+
+                # 买入逻辑
+                if is_buy_allowed(now_time, buy_prob):
+                    if not ALLOW_ADDING_TO_EXISTING and tracker.get_info(symbol) is not None:
+                        logger.info(f"  {symbol} 已有持仓，禁止加仓")
+                        continue
+
+                    if current_ratio >= MAX_SINGLE_POSITION_PCT:
+                        logger.info(f"  {symbol} 已达仓位上限 {current_ratio*100:.1f}%")
+                        continue
+
+                    max_allowed_value = buying_power * MAX_SINGLE_POSITION_PCT
+                    remaining = max_allowed_value - current_market_value
+                    if remaining <= 0:
+                        logger.info(f"  {symbol} 剩余可用仓位 ${remaining:.2f} <= 0")
+                        continue
+
+                    proposed = remaining * BUY_AMOUNT_PCT
+                    if proposed < 1.0:
+                        logger.info(f"  {symbol} 拟投金额 ${proposed:.2f} < 1 美元")
+                        continue
+
+                    logger.info(f"🎯 买入 {symbol} | 价格 {current_price:.2f} | 概率 {buy_prob:.3f} | "
+                                f"当前仓位 {current_ratio*100:.1f}% | 拟投 ${proposed:.2f}")
+                    success, msg, oid = place_buy_order(trade_client, symbol, proposed)
+                    if success:
+                        time.sleep(0.5)
+                        new_pos = get_positions(trade_client)
+                        new_row = new_pos[new_pos['symbol'] == symbol]
+                        if not new_row.empty:
+                            new_cost = new_row.iloc[0]['cost_price']
+                            new_qty = new_row.iloc[0]['qty']
+                            if symbol not in tracker.positions:
+                                atr_val = df['atr'].iloc[-1] if 'atr' in df.columns else 0
+                                tracker.add(symbol, new_cost, atr_val)
+                            logger.info(f"买入成功，{symbol} 成本 ${new_cost:.2f} 持仓 {new_qty:.6f} 股")
+                            total, cash, buying_power = get_account_balance(trade_client)
+                        else:
+                            logger.warning(f"买入后未找到持仓 {symbol}")
+                    else:
+                        logger.error(f"买入失败: {msg}")
+                else:
+                    if buy_prob >= PROB_THRESHOLD_BUY:
+                        logger.info(f"  {symbol} 买入被拒绝：时间或置信度条件未满足")
+
+                time.sleep(0.8)
+
+            logger.info(f"⏳ 等待 {CHECK_INTERVAL_SEC} 秒...")
+            for _ in range(CHECK_INTERVAL_SEC):
+                if stop_event.is_set():
+                    break
+                time.sleep(1)
+
+        except Exception as e:
+            logger.exception(f"交易循环内部错误: {e}")
+            time.sleep(CHECK_INTERVAL_SEC)
+
+    logger.info("机器人线程已停止")
+
+# ================== Flask Web 服务 ==================
 app = Flask(__name__)
 
 HTML_TEMPLATE = '''
@@ -891,258 +992,193 @@ HTML_TEMPLATE = '''
 <html>
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>TradeBoy</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+    <title>Webull Bot</title>
     <style>
-        * { box-sizing: border-box; user-select: none; }
+        * { box-sizing: border-box; }
         body {
-            background: #8b8b8b;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            font-family: 'Courier New', 'VT323', monospace;
+            background: #1a1a2e;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             margin: 0;
             padding: 20px;
+            color: #eee;
         }
-        .gameboy {
-            background: #b5b5b5;
+        .container {
+            max-width: 700px;
+            margin: 0 auto;
+            background: #16213e;
             border-radius: 20px;
-            box-shadow: 0 10px 0 #5a5a5a;
-            padding: 20px 20px 30px;
-            max-width: 620px;
-            width: 100%;
+            padding: 20px;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.3);
         }
-        .screen {
-            background: #9bbc0f;
-            border: 5px solid #306230;
-            border-radius: 12px;
-            padding: 10px;
-            margin-bottom: 15px;
-            font-family: monospace;
-            color: #0f380f;
-            font-weight: bold;
-            font-size: 13px;
-            box-shadow: inset 0 0 5px #306230;
-        }
-        .balance {
-            background: #0f380f;
-            color: #9bbc0f;
-            padding: 8px;
-            border-radius: 8px;
-            margin-bottom: 10px;
+        h1 {
             text-align: center;
-            font-size: 15px;
+            font-size: 1.8rem;
+            margin: 0 0 15px 0;
+            color: #e94560;
         }
-        .positions {
-            background: #e0f0d0;
-            padding: 8px;
-            border-radius: 8px;
-            max-height: 200px;
-            overflow-y: auto;
-            font-size: 12px;
-            margin-bottom: 10px;
-        }
-        .positions table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-        .positions th, .positions td {
-            text-align: left;
-            padding: 4px 2px;
-            border-bottom: 1px solid #7c8c5e;
-        }
-        .log-area {
-            background: #0f380f;
-            color: #9bbc0f;
-            padding: 6px;
-            border-radius: 8px;
-            height: 150px;
-            overflow-y: auto;
-            font-size: 11px;
-            font-family: monospace;
+        .status-bar {
+            background: #0f3460;
+            border-radius: 12px;
+            padding: 12px;
             margin-bottom: 15px;
-            text-align: left;
-        }
-        .log-area p {
-            margin: 2px 0;
-            border-bottom: 1px dotted #306230;
-        }
-        .controls {
             display: flex;
-            justify-content: space-around;
-            gap: 15px;
-            margin-top: 5px;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
         }
-        button {
-            background: #4b4b4b;
-            border: none;
-            color: white;
-            font-family: inherit;
-            font-size: 18px;
-            font-weight: bold;
-            padding: 12px 16px;
-            border-radius: 50px;
-            box-shadow: 0 5px 0 #2a2a2a;
-            cursor: pointer;
-            transition: 0.05s linear;
-            flex: 1;
-            letter-spacing: 2px;
-        }
-        button:active {
-            transform: translateY(2px);
-            box-shadow: 0 2px 0 #2a2a2a;
-        }
-        button.start { background: #3a7a3a; box-shadow: 0 5px 0 #1e4a1e; }
-        button.stop { background: #aa4a4a; box-shadow: 0 5px 0 #6a2a2a; }
-        button.force { background: #aa6a2a; box-shadow: 0 5px 0 #6a3a0a; }
-        .status {
+        .status-led {
             display: inline-block;
             width: 12px;
             height: 12px;
             border-radius: 50%;
-            background: #333;
-            margin-right: 6px;
+            background: #e74c3c;
+            box-shadow: 0 0 5px #e74c3c;
+            margin-right: 8px;
         }
-        .status.running { background: #2ecc2e; box-shadow: 0 0 5px #2ecc2e; }
-        .status.stopped { background: #e74c3c; }
+        .status-led.running {
+            background: #2ecc71;
+            box-shadow: 0 0 5px #2ecc71;
+        }
+        .balance {
+            background: #0f3460;
+            border-radius: 12px;
+            padding: 10px;
+            margin-bottom: 15px;
+            font-size: 0.9rem;
+            text-align: center;
+        }
+        .positions {
+            background: #0f3460;
+            border-radius: 12px;
+            padding: 10px;
+            margin-bottom: 15px;
+            max-height: 250px;
+            overflow-y: auto;
+        }
+        .positions table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.8rem;
+        }
+        .positions th, .positions td {
+            padding: 6px 4px;
+            text-align: left;
+            border-bottom: 1px solid #2a4a7a;
+        }
+        .log-area {
+            background: #0a1a2a;
+            border-radius: 12px;
+            padding: 10px;
+            height: 200px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 0.75rem;
+            margin-bottom: 15px;
+        }
+        .log-entry {
+            border-bottom: 1px solid #1a3a5a;
+            padding: 3px 0;
+        }
+        .log-info { color: #88c0ff; }
+        .log-warning { color: #ffaa44; }
+        .log-error { color: #ff6666; }
+        .buttons {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        button {
+            background: #e94560;
+            border: none;
+            color: white;
+            font-size: 1rem;
+            font-weight: bold;
+            padding: 10px 20px;
+            border-radius: 40px;
+            cursor: pointer;
+            transition: 0.1s linear;
+            flex: 1;
+            min-width: 100px;
+        }
+        button:active {
+            transform: scale(0.97);
+        }
+        .btn-start { background: #2ecc71; }
+        .btn-stop { background: #e74c3c; }
+        .btn-force { background: #f39c12; }
         .refresh-note {
             text-align: center;
-            font-size: 10px;
-            margin-top: 10px;
-            color: #306230;
+            font-size: 0.7rem;
+            margin-top: 12px;
+            color: #888;
         }
         .disclaimer {
-            font-size: 10px;
+            font-size: 0.7rem;
             text-align: center;
             margin-top: 15px;
-            color: #306230;
-            border-top: 1px solid #306230;
-            padding-top: 8px;
+            padding-top: 10px;
+            border-top: 1px solid #2a4a7a;
+            color: #aaa;
         }
-        .modal {
-            display: none;
-            position: fixed;
-            z-index: 1000;
-            left: 0;
-            top: 0;
-            width: 100%;
-            height: 100%;
-            background-color: rgba(0,0,0,0.6);
-            align-items: center;
-            justify-content: center;
-        }
-        .modal-content {
-            background-color: #b5b5b5;
-            border-radius: 20px;
-            padding: 20px;
-            text-align: center;
-            max-width: 280px;
-            font-family: monospace;
-            border: 3px solid #306230;
-        }
-        .modal-buttons {
-            display: flex;
-            justify-content: space-around;
-            margin-top: 20px;
-        }
-        .modal-buttons button {
-            font-size: 16px;
-            padding: 8px 12px;
-            width: 80px;
+        @media (max-width: 500px) {
+            .container { padding: 15px; }
+            button { padding: 8px 12px; font-size: 0.9rem; }
         }
     </style>
 </head>
 <body>
-<div class="gameboy">
-    <div class="screen">
-        <div class="balance" id="balanceArea">💰 載入中...</div>
-        <div class="positions" id="positionsArea">📋 持倉列表</div>
-        <div class="log-area" id="logArea">📜 日誌區域</div>
+<div class="container">
+    <h1>🤖 Webull Bot</h1>
+    <div class="status-bar">
+        <span><span id="statusLed" class="status-led"></span> <span id="statusText">加载中...</span></span>
+        <span id="timeDisplay"></span>
     </div>
-    <div class="controls">
-        <button class="start" id="btnStart">▶ 開始</button>
-        <button class="stop" id="btnStop">⏹ 停止</button>
-        <button class="force" id="btnForce">⛔ 平倉並停止</button>
+    <div class="balance" id="balanceArea">💰 加载账户信息...</div>
+    <div class="positions" id="positionsArea">📋 持仓列表</div>
+    <div class="log-area" id="logArea">📜 日志区域</div>
+    <div class="buttons">
+        <button class="btn-start" id="btnStart">▶ 启动</button>
+        <button class="btn-stop" id="btnStop">⏹ 停止</button>
+        <button class="btn-force" id="btnForce">⚠️ 平仓并停止</button>
     </div>
-    <div class="refresh-note">
-        <span id="statusLed" class="status stopped"></span> 機器人狀態：<span id="runStatus">已停止</span>
-    </div>
+    <div class="refresh-note">数据自动刷新 (3秒)</div>
     <div class="disclaimer">
-        ⚠️ 免責聲明：本機器人為輔助交易工具，不保證獲利。任何因使用本程式造成的投資損失，開發者與 AI 協助者概不負責。請謹慎使用，風險自負。
-    </div>
-</div>
-
-<div id="confirmModal" class="modal">
-    <div class="modal-content">
-        <p id="modalMessage">確定要執行此操作嗎？</p>
-        <div class="modal-buttons">
-            <button id="modalConfirm">確認</button>
-            <button id="modalCancel">取消</button>
-        </div>
+        ⚠️ 免责声明：本工具为辅助交易系统，不保证盈利。使用风险自负。
     </div>
 </div>
 
 <script>
-    let pendingAction = null;
-
-    function showModal(message, onConfirm) {
-        const modal = document.getElementById('confirmModal');
-        const msgSpan = document.getElementById('modalMessage');
-        msgSpan.innerText = message;
-        modal.style.display = 'flex';
-        const confirmBtn = document.getElementById('modalConfirm');
-        const cancelBtn = document.getElementById('modalCancel');
-        const handler = () => {
-            modal.style.display = 'none';
-            confirmBtn.removeEventListener('click', handler);
-            cancelBtn.removeEventListener('click', cancelHandler);
-            onConfirm();
-        };
-        const cancelHandler = () => {
-            modal.style.display = 'none';
-            confirmBtn.removeEventListener('click', handler);
-            cancelBtn.removeEventListener('click', cancelHandler);
-        };
-        confirmBtn.addEventListener('click', handler);
-        cancelBtn.addEventListener('click', cancelHandler);
-    }
-
     function fetchStatus() {
         fetch('/status')
             .then(res => res.json())
             .then(data => {
-                const isRunning = data.running;
+                const running = data.running;
                 const led = document.getElementById('statusLed');
-                const statusText = document.getElementById('runStatus');
-                if (isRunning) {
-                    led.className = 'status running';
-                    statusText.innerText = '運行中';
+                const statusSpan = document.getElementById('statusText');
+                if (running) {
+                    led.className = 'status-led running';
+                    statusSpan.innerText = '运行中';
                 } else {
-                    led.className = 'status stopped';
-                    statusText.innerText = '已停止';
+                    led.className = 'status-led';
+                    statusSpan.innerText = '已停止';
                 }
-                const username = data.username || '未知';
-                const total = data.total || 0;
-                const available = data.available || 0;
-                document.getElementById('balanceArea').innerHTML = `
-                    👤 ${username} &nbsp;| 💰 淨資產: $${total.toFixed(2)} &nbsp;| 可用: $${available.toFixed(2)}
-                `;
+                document.getElementById('balanceArea').innerHTML = `👤 ${data.username || '未知'} &nbsp;| 💰 净资产: $${data.total.toFixed(2)} &nbsp;| 可用: $${data.available.toFixed(2)}`;
                 const positions = data.positions || [];
                 if (positions.length === 0) {
-                    document.getElementById('positionsArea').innerHTML = '📋 暫無持倉';
+                    document.getElementById('positionsArea').innerHTML = '📋 暂无持仓';
                 } else {
-                    let html = `<tr><th>股票</th><th>股數</th><th>成本</th><th>現價</th><th>盈虧</th></tr>`;
+                    let html = `<table><th>股票</th><th>股数</th><th>成本</th><th>现价</th><th>盈亏</th></tr>`;
                     positions.forEach(p => {
-                        let priceStr = p.price ? p.price.toFixed(2) : '--';
-                        let pnlStr = p.pnl ? p.pnl.toFixed(2) : '0.00';
-                        let pnlColor = p.pnl >= 0 ? '#2a6b2a' : '#aa4a4a';
+                        const pnl = p.pnl || 0;
+                        const color = pnl >= 0 ? '#2ecc71' : '#e74c3c';
                         html += `<tr>
                             <td>${p.symbol}</td>
                             <td>${p.qty.toFixed(4)}</td>
-                            <td>${p.cost.toFixed(2)}</td>
-                            <td>${priceStr}</td>
-                            <td style="color:${pnlColor}">$${pnlStr}</td>
+                            <td>$${p.cost.toFixed(2)}</td>
+                            <td>${p.price ? '$'+p.price.toFixed(2) : '--'}</td>
+                            <td style="color:${color}">$${pnl.toFixed(2)}</td>
                         </tr>`;
                     });
                     html += `</table>`;
@@ -1151,49 +1187,36 @@ HTML_TEMPLATE = '''
                 const logs = data.logs || [];
                 const logDiv = document.getElementById('logArea');
                 if (logs.length === 0) {
-                    logDiv.innerHTML = '📜 尚無日誌';
+                    logDiv.innerHTML = '📜 暂无日志';
                 } else {
                     let logHtml = '';
                     logs.slice().reverse().forEach(log => {
-                        logHtml += `<p>[${log.time}] ${log.level}: ${log.msg}</p>`;
+                        let levelClass = 'log-info';
+                        if (log.level === 'WARNING') levelClass = 'log-warning';
+                        if (log.level === 'ERROR') levelClass = 'log-error';
+                        logHtml += `<div class="log-entry ${levelClass}">[${log.time}] ${log.level}: ${log.msg}</div>`;
                     });
                     logDiv.innerHTML = logHtml;
                 }
+                document.getElementById('timeDisplay').innerHTML = new Date().toLocaleTimeString();
             })
-            .catch(err => console.error('獲取狀態失敗', err));
+            .catch(err => console.error(err));
     }
 
     function sendCommand(endpoint, confirmMsg) {
-        if (confirmMsg) {
-            showModal(confirmMsg, () => {
-                fetch(endpoint, { method: 'POST' })
-                    .then(res => res.json())
-                    .then(data => {
-                        console.log(data);
-                        fetchStatus();
-                    })
-                    .catch(err => alert('命令發送失敗: ' + err));
-            });
-        } else {
-            fetch(endpoint, { method: 'POST' })
-                .then(res => res.json())
-                .then(data => {
-                    console.log(data);
-                    fetchStatus();
-                })
-                .catch(err => alert('命令發送失敗: ' + err));
-        }
+        if (confirmMsg && !confirm(confirmMsg)) return;
+        fetch(endpoint, { method: 'POST' })
+            .then(res => res.json())
+            .then(data => {
+                console.log(data);
+                fetchStatus();
+            })
+            .catch(err => alert('命令失败: ' + err));
     }
 
-    document.getElementById('btnStart').addEventListener('click', () => {
-        sendCommand('/start', '確定要啟動機器人嗎？');
-    });
-    document.getElementById('btnStop').addEventListener('click', () => {
-        sendCommand('/stop', '確定要停止機器人嗎？停止不會賣出任何股票，機器人將暫停交易。');
-    });
-    document.getElementById('btnForce').addEventListener('click', () => {
-        sendCommand('/force_stop', '⚠️ 確定要強制平倉所有持倉並停止機器人？此操作不可逆！');
-    });
+    document.getElementById('btnStart').onclick = () => sendCommand('/start', '确定启动机器人？');
+    document.getElementById('btnStop').onclick = () => sendCommand('/stop', '确定停止机器人？不会卖出持仓。');
+    document.getElementById('btnForce').onclick = () => sendCommand('/force_stop', '⚠️ 确定强制平仓并停止？此操作不可逆！');
 
     fetchStatus();
     setInterval(fetchStatus, 3000);
@@ -1202,20 +1225,16 @@ HTML_TEMPLATE = '''
 </html>
 '''
 
-@app.route('/favicon.ico')
-def favicon():
-    return '', 204
-
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
 
 @app.route('/status')
 def status():
-    is_running = not stop_event.is_set() and bot_thread is not None and bot_thread.is_alive()
+    running = (bot_thread is not None and bot_thread.is_alive() and not stop_event.is_set())
     if trade_client is None:
         return jsonify({
-            "running": is_running,
+            "running": False,
             "total": 0,
             "available": 0,
             "positions": [],
@@ -1223,7 +1242,7 @@ def status():
             "logs": ui_log_messages[-50:]
         })
     try:
-        total, available = get_account_balance(trade_client)
+        total, available, _ = get_account_balance(trade_client)
         pos_df = get_positions(trade_client)
         positions = []
         for _, row in pos_df.iterrows():
@@ -1240,7 +1259,7 @@ def status():
                 'pnl': pnl
             })
         return jsonify({
-            "running": is_running,
+            "running": running,
             "total": total,
             "available": available,
             "positions": positions,
@@ -1248,12 +1267,12 @@ def status():
             "logs": ui_log_messages[-50:]
         })
     except Exception as e:
-        logger.exception("獲取狀態失敗")
+        logger.exception("获取状态失败")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/start', methods=['POST'])
 def start_bot():
-    global bot_thread, stop_event, trade_client, data_client, models, webull_username, account_id
+    global bot_thread, stop_event, trade_client, data_client, models, webull_username, account_id, position_tracker
     with thread_lock:
         if bot_thread is not None and bot_thread.is_alive() and not stop_event.is_set():
             return jsonify({"status": "already running"})
@@ -1262,9 +1281,9 @@ def start_bot():
                 trade_client, data_client, webull_username, account_id = init_webull_clients()
                 models = load_models()
                 if not models:
-                    raise ValueError("無法載入任何模型，請檢查 models 目錄")
+                    raise ValueError("无法加载任何模型")
             except Exception as e:
-                logger.exception("初始化失敗")
+                logger.exception("初始化失败")
                 return jsonify({"status": "init failed", "error": str(e)}), 500
         stop_event.clear()
         bot_thread = threading.Thread(target=bot_loop, daemon=True)
@@ -1274,22 +1293,18 @@ def start_bot():
 @app.route('/stop', methods=['POST'])
 def stop_bot():
     global stop_event
-    with thread_lock:
-        stop_event.set()
+    stop_event.set()
     return jsonify({"status": "stopping"})
 
 @app.route('/force_stop', methods=['POST'])
 def force_stop():
-    global trade_client, stop_event
-    if trade_client is None:
-        return jsonify({"status": "trade client not ready"})
-    force_close_all(trade_client)
-    with thread_lock:
-        stop_event.set()
+    global trade_client, stop_event, position_tracker
+    if trade_client is not None and position_tracker is not None:
+        force_close_all(trade_client, position_tracker)
+    stop_event.set()
     return jsonify({"status": "force stopped and liquidated"})
 
 if __name__ == '__main__':
     os.makedirs("conf", exist_ok=True)
-    os.makedirs("static", exist_ok=True)
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
