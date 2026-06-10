@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-<<<<<<< HEAD
 Webull 交易机器人 - 完整 Web 版（与 trade.py 策略完全一致）
 - 支持手机访问
 - 实时状态查看（持仓、余额、日志）
 - 远程启动/停止/强制平仓
 - 时间参数：高置信度15:00，禁止买入15:15，智能卖出15:15，强制平仓15:30
-=======
-Webull 交易機器人 - 終極相容版（自動修復舊版 H5 模型）
->>>>>>> 449daf10083799a14f565e7ce27c1c7ad6b26599
 """
 
 import os
@@ -27,8 +23,6 @@ import hmac
 import base64
 import threading
 import requests
-import tempfile
-import h5py
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, time as dt_time, timezone
 from zoneinfo import ZoneInfo
@@ -46,6 +40,7 @@ from webull.trade.trade_client import TradeClient
 from webull.data.data_client import DataClient
 from webull.data.common.category import Category
 from webull.data.common.timespan import Timespan
+from webull.core.exception.exceptions import ServerException
 
 load_dotenv()
 
@@ -132,18 +127,8 @@ logger.addHandler(console)
 
 # 前端日志队列
 ui_log_messages = []
-<<<<<<< HEAD
 def add_ui_log(level: str, msg: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
-=======
-
-def add_ui_log(level: str, msg: str):
-    # 排除資產查詢等雜訊
-    exclude_keywords = ['美元淨資產', '可用現金']
-    if any(k in msg for k in exclude_keywords):
-        return
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
->>>>>>> 449daf10083799a14f565e7ce27c1c7ad6b26599
     ui_log_messages.append({"time": timestamp, "level": level, "msg": msg})
     while len(ui_log_messages) > 200:
         ui_log_messages.pop(0)
@@ -208,11 +193,7 @@ def is_sell_allowed(now_time: dt_time) -> bool:
 def is_force_sell_time(now_time: dt_time) -> bool:
     return now_time >= FORCE_SELL_TIME
 
-<<<<<<< HEAD
 # ================== Webull 客户端初始化 ==================
-=======
-# ================== Webull 客戶端初始化 ==================
->>>>>>> 449daf10083799a14f565e7ce27c1c7ad6b26599
 def init_webull_clients() -> Tuple[TradeClient, DataClient, str, str]:
     global webull_username, account_id
     logger.info("正在初始化 Webull 客户端...")
@@ -240,11 +221,7 @@ def init_webull_clients() -> Tuple[TradeClient, DataClient, str, str]:
         raise ValueError("account_id 不存在")
     logger.info(f"获取到 account_id: {account_id}")
     
-<<<<<<< HEAD
     # 获取用户名（尝试多种方式）
-=======
-    # 獲取用戶名
->>>>>>> 449daf10083799a14f565e7ce27c1c7ad6b26599
     try:
         webull_username = accounts[0].get("account_name", "未知")
         if webull_username == "未知":
@@ -654,7 +631,6 @@ def compute_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     df.drop(columns=['hour', 'atr_adx', 'dx'], errors='ignore', inplace=True)
     return df.dropna().reset_index(drop=True)
 
-<<<<<<< HEAD
 # ================== 模型加载与预测 ==================
 class CompatibleInputLayer(tf.keras.layers.InputLayer):
     def __init__(self, **kwargs):
@@ -676,38 +652,6 @@ class DummyDTypePolicy:
         return tf.float32
     def __repr__(self):
         return f'<DummyDTypePolicy name="{self._name}">'
-=======
-# ================== 模型載入（修復 H5 檔案中的舊參數） ==================
-def fix_h5_model(path):
-    """複製並修復 H5 檔案中 InputLayer 的 optional 參數"""
-    # 建立臨時檔案
-    fd, temp_path = tempfile.mkstemp(suffix='.h5')
-    os.close(fd)
-    
-    # 複製原始檔案到臨時檔案
-    with open(path, 'rb') as src, open(temp_path, 'wb') as dst:
-        dst.write(src.read())
-    
-    # 使用 h5py 修改臨時檔案
-    try:
-        with h5py.File(temp_path, 'r+') as f:
-            # 遞迴查找所有 config 屬性
-            def fix_config(name, obj):
-                if isinstance(obj, h5py.Dataset) and 'config' in name:
-                    config_str = obj[()].decode('utf-8')
-                    # 替換 'optional': True/False 為空
-                    import re
-                    fixed = re.sub(r',?\s*"optional":\s*(true|false)', '', config_str)
-                    if fixed != config_str:
-                        obj[()] = fixed.encode('utf-8')
-                        logger.debug(f"Fixed config in {name}")
-            f.visititems(fix_config)
-        return temp_path
-    except Exception as e:
-        logger.warning(f"修復模型失敗: {e}, 使用原始檔案")
-        os.unlink(temp_path)
-        return path
->>>>>>> 449daf10083799a14f565e7ce27c1c7ad6b26599
 
 def load_models() -> Dict[str, Tuple]:
     models_dict = {}
@@ -722,10 +666,8 @@ def load_models() -> Dict[str, Tuple]:
         with open(xgb_path, 'rb') as f:
             xgb_model = pickle.load(f)
         
-        # 修復 LSTM 模型
-        fixed_path = fix_h5_model(lstm_path)
+        lstm_model = None
         try:
-<<<<<<< HEAD
             lstm_model = tf.keras.models.load_model(lstm_path, compile=False)
             logger.info(f"直接加载 {symbol} LSTM 成功")
         except Exception as e:
@@ -744,16 +686,6 @@ def load_models() -> Dict[str, Tuple]:
             except Exception as e2:
                 logger.error(f"仍无法加载 {symbol} LSTM: {e2}，跳过此股票")
                 continue
-=======
-            lstm_model = tf.keras.models.load_model(fixed_path, compile=False)
-            logger.info(f"成功載入 {symbol} LSTM")
-        except Exception as e:
-            logger.error(f"無法載入 {symbol} LSTM: {e}，跳過此股票")
-            continue
-        finally:
-            if fixed_path != lstm_path and os.path.exists(fixed_path):
-                os.unlink(fixed_path)
->>>>>>> 449daf10083799a14f565e7ce27c1c7ad6b26599
         
         with open(scaler_path, 'rb') as f:
             scaler = pickle.load(f)
@@ -892,28 +824,14 @@ def force_close_all(trade_client: TradeClient, tracker: PositionTracker) -> int:
     logger.warning(f"强制平仓完成，共平仓 {closed} 个持仓")
     return closed
 
-<<<<<<< HEAD
 # ================== 机器人主循环 ==================
-=======
-# ================== 機器人主循環 ==================
->>>>>>> 449daf10083799a14f565e7ce27c1c7ad6b26599
 def bot_loop():
     global stop_event, trade_client, data_client, models, position_tracker
     logger.info("机器人线程启动，开始交易循环")
     tracker = PositionTracker()
-<<<<<<< HEAD
     position_tracker = tracker  # 供强制平仓调用
 
     # 同步现有持仓
-=======
-    
-    last_waiting_msg_time = 0
-    last_high_conf_mode = False
-    last_stop_buy_mode = False
-    last_start_sell_mode = False
-    last_force_sell_mode = False
-    
->>>>>>> 449daf10083799a14f565e7ce27c1c7ad6b26599
     try:
         pos_df = get_positions(trade_client)
         for _, row in pos_df.iterrows():
@@ -933,7 +851,6 @@ def bot_loop():
         stop_event.set()
         return
 
-<<<<<<< HEAD
     last_short = time.time()
     last_long = time.time()
     
@@ -943,58 +860,6 @@ def bot_loop():
             if not is_us_market_open():
                 time.sleep(CHECK_INTERVAL_SEC)
                 continue
-=======
-    try:
-        while not stop_event.is_set():
-            try:
-                now_et = get_current_et()
-                now_time = now_et.time()
-                
-                high_conf_active = now_time >= HIGH_CONFIDENCE_START_TIME
-                stop_buy_active = now_time >= STOP_BUY_TIME
-                start_sell_active = now_time >= START_SELL_TIME
-                force_sell_active = now_time >= FORCE_SELL_TIME
-                
-                if high_conf_active and not last_high_conf_mode:
-                    logger.info("🔔 已進入高信賴度買入模式 (14:45後，買入需 ≥75% 信心)")
-                elif not high_conf_active and last_high_conf_mode and now_time.hour < 14:
-                    logger.info("🔔 已離開高信賴度買入模式")
-                last_high_conf_mode = high_conf_active
-                
-                if stop_buy_active and not last_stop_buy_mode:
-                    logger.info("⛔ 已到達停止買入時間 15:00，禁止新買入")
-                last_stop_buy_mode = stop_buy_active
-                
-                if start_sell_active and not last_start_sell_mode:
-                    logger.info("💰 已到達開始賣出時間 15:00，啟用智能賣出")
-                last_start_sell_mode = start_sell_active
-                
-                if force_sell_active and not last_force_sell_mode:
-                    logger.info("⚠️ 已到達強制平倉時間 15:15，將平倉所有持倉")
-                last_force_sell_mode = force_sell_active
-                
-                market_open = is_us_market_open()
-                if not market_open:
-                    if time.time() - last_waiting_msg_time > 60:
-                        logger.info("⏳ 美股尚未開盤（美東時間 9:30-16:00），機器人等待中...")
-                        last_waiting_msg_time = time.time()
-                    for _ in range(CHECK_INTERVAL_SEC):
-                        if stop_event.is_set():
-                            break
-                        time.sleep(1)
-                    continue
-                else:
-                    last_waiting_msg_time = 0
-                    if not hasattr(bot_loop, "_market_open_just_entered"):
-                        logger.info("📈 美股已開盤，機器人開始掃描標的")
-                        bot_loop._market_open_just_entered = True
-                
-                if is_force_sell_time(now_time):
-                    logger.info("到達強制平倉時間 15:15，平倉所有持倉")
-                    force_close_all(trade_client)
-                    stop_event.set()
-                    break
->>>>>>> 449daf10083799a14f565e7ce27c1c7ad6b26599
 
             now_et = get_current_et()
             now_time = now_et.time()
@@ -1411,7 +1276,7 @@ def start_bot():
     with thread_lock:
         if bot_thread is not None and bot_thread.is_alive() and not stop_event.is_set():
             return jsonify({"status": "already running"})
-        if trade_client is None or len(models) == 0:
+        if trade_client is None:
             try:
                 trade_client, data_client, webull_username, account_id = init_webull_clients()
                 models = load_models()
