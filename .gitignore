@@ -1,0 +1,34 @@
+# 敏感資料
+conf/token.txt
+.env
+
+# 模型檔案（選擇性，若上傳可用 Git LFS）
+models/*.pkl
+models/*.h5
+models/*.json
+
+# 日誌
+logs/
+*.log
+
+# Python 快取
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 虛擬環境
+venv/
+env/
+.venv/
+
+# IDE 設定
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 作業系統
+.DS_Store
+Thumbs.db
